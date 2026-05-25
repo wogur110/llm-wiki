@@ -1,0 +1,8 @@
+private/
+logs/
+wiki/.next/
+wiki/node_modules/
+wiki/src-tauri/target/
+content/papers/.staging/
+content/meta/pending-zotero-sync.json
+.env*
