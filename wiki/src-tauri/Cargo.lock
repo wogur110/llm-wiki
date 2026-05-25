@@ -2237,6 +2237,7 @@ name = "llm-wiki"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "futures-util",
  "keyring",
@@ -2250,6 +2251,7 @@ dependencies = [
  "tauri-plugin-shell",
  "tempfile",
  "tokio",
+ "walkdir",
 ]
 
 [[package]]

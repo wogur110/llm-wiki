@@ -49,9 +49,38 @@ struct GeminiContent {
     parts: Vec<GeminiPart>,
 }
 
-#[derive(Debug, Serialize)]
+/// A single Gemini "part" — either text or inline binary data (PDFs, images).
+/// Serialised with `inline_data` (snake_case) which is what the v1beta REST API accepts.
+#[derive(Debug, Serialize, Default)]
 struct GeminiPart {
-    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "inline_data")]
+    inline_data: Option<InlineData>,
+}
+
+impl GeminiPart {
+    fn text(s: impl Into<String>) -> Self {
+        Self { text: Some(s.into()), inline_data: None }
+    }
+
+    fn pdf(bytes: &[u8]) -> Self {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        Self {
+            text: None,
+            inline_data: Some(InlineData {
+                mime_type: "application/pdf".into(),
+                data: STANDARD.encode(bytes),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct InlineData {
+    #[serde(rename = "mime_type")]
+    mime_type: String,
+    data: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -108,7 +137,7 @@ fn to_gemini_contents(messages: Vec<Message>) -> Vec<GeminiContent> {
         .into_iter()
         .map(|m| GeminiContent {
             role: m.role,
-            parts: vec![GeminiPart { text: m.text }],
+            parts: vec![GeminiPart::text(m.text)],
         })
         .collect()
 }
@@ -181,10 +210,7 @@ pub async fn test_connection(api_key: Option<String>) -> Result<bool, String> {
     let body = GeminiRequest {
         contents: vec![GeminiContent {
             role: "user".into(),
-            parts: vec![GeminiPart {
-                // Shortest possible prompt that forces a text response
-                text: "Reply with exactly one word: ok".into(),
-            }],
+            parts: vec![GeminiPart::text("Reply with exactly one word: ok")],
         }],
     };
 
@@ -347,7 +373,7 @@ pub async fn classify_paper(
     let request_body = GeminiRequest {
         contents: vec![GeminiContent {
             role: "user".into(),
-            parts: vec![GeminiPart { text: prompt }],
+            parts: vec![GeminiPart::text(prompt)],
         }],
     };
 
@@ -374,6 +400,99 @@ pub async fn classify_paper(
     }
 
     Ok(category)
+}
+
+/// Convert a PDF file (read into memory) into a markdown document.
+///
+/// Sends the raw PDF inline (base64) to Gemini along with a prompt that asks
+/// for a structured markdown export with YAML frontmatter.  Suitable for
+/// research papers up to ~20 MB — the Gemini inline limit.
+///
+/// The returned string is expected to start with a YAML frontmatter block
+/// containing at least `title:` and `abstract:` so the existing organiser
+/// pipeline (`organizer::process_paper`) can classify it without changes.
+///
+/// # Errors
+/// * Missing API key
+/// * Network / HTTP error (401, 429, 5xx)
+/// * Empty response from Gemini
+pub async fn extract_pdf_to_markdown(pdf_bytes: Vec<u8>) -> Result<String, String> {
+    const MAX_INLINE_BYTES: usize = 20 * 1024 * 1024;
+    if pdf_bytes.len() > MAX_INLINE_BYTES {
+        return Err(format!(
+            "PDF is {} MB — Gemini inline limit is 20 MB. Split the file or use the File API.",
+            pdf_bytes.len() / (1024 * 1024)
+        ));
+    }
+
+    let api_key = crate::keychain::get_key_inner()
+        .map_err(|e| format!("No API key in keychain: {e}"))?;
+
+    let client = build_client();
+    let url = format!("{API_BASE}/{MODEL}:generateContent?key={api_key}");
+
+    let prompt = "You convert a research paper PDF into a markdown document for a personal wiki. \
+Rules:\n\
+1. Start with a YAML frontmatter block delimited by `---` containing exactly these fields, no others:\n\
+   - title: \"<paper title>\"\n\
+   - authors: \"<comma-separated author list>\"\n\
+   - abstract: \"<full abstract, single line, escape quotes>\"\n\
+   - doi: \"<DOI string or empty>\"\n\
+   - year: <publication year or empty>\n\
+2. After the closing `---`, render the paper body in GitHub-flavoured markdown:\n\
+   - Use `##` for top-level sections (Introduction, Method, …), `###` for subsections.\n\
+   - Preserve display math as `$$ … $$` and inline math as `$ … $` (LaTeX, not unicode).\n\
+   - Skip references, figures, and tables that are purely visual; keep figure captions inline.\n\
+3. Do NOT wrap the response in ```markdown fences. Output the document directly.";
+
+    let request_body = GeminiRequest {
+        contents: vec![GeminiContent {
+            role: "user".into(),
+            parts: vec![GeminiPart::text(prompt), GeminiPart::pdf(&pdf_bytes)],
+        }],
+    };
+
+    let resp = client
+        .post(&url)
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format_gemini_http_error(status));
+    }
+
+    let parsed: GeminiResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("JSON decode error: {e}"))?;
+
+    let text = extract_ns_text(&parsed)
+        .ok_or_else(|| "Gemini returned no markdown content".to_string())?;
+
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("Gemini returned an empty markdown body".into());
+    }
+
+    Ok(strip_markdown_fence(text))
+}
+
+/// Trim a ```markdown … ``` fence if Gemini ignores the no-fence instruction.
+fn strip_markdown_fence(s: &str) -> String {
+    let trimmed = s.trim();
+    let body = trimmed
+        .strip_prefix("```markdown")
+        .or_else(|| trimmed.strip_prefix("```md"))
+        .or_else(|| trimmed.strip_prefix("```"))
+        .map(|rest| rest.trim_start_matches('\n'))
+        .unwrap_or(trimmed);
+
+    body.strip_suffix("```")
+        .map(|s| s.trim_end().to_string())
+        .unwrap_or_else(|| body.to_string())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -504,7 +623,34 @@ mod tests {
         ]);
         assert_eq!(contents.len(), 2);
         assert_eq!(contents[0].role, "user");
-        assert_eq!(contents[1].parts[0].text, "hi");
+        assert_eq!(contents[1].parts[0].text.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn strip_markdown_fence_removes_wrapping_fence() {
+        use super::strip_markdown_fence;
+        let input = "```markdown\n---\ntitle: x\n---\nbody\n```";
+        let out = strip_markdown_fence(input);
+        assert!(out.starts_with("---"));
+        assert!(out.ends_with("body"));
+    }
+
+    #[test]
+    fn strip_markdown_fence_leaves_plain_text_untouched() {
+        use super::strip_markdown_fence;
+        let input = "---\ntitle: x\n---\nbody";
+        let out = strip_markdown_fence(input);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn gemini_part_pdf_encodes_base64() {
+        use super::GeminiPart;
+        let part = GeminiPart::pdf(b"%PDF-1.4 test");
+        let inline = part.inline_data.expect("inline_data should be set");
+        assert_eq!(inline.mime_type, "application/pdf");
+        assert!(!inline.data.is_empty());
+        assert!(part.text.is_none());
     }
 
     /// Passes trivially in offline environments (network error ≠ success).
@@ -517,9 +663,7 @@ mod tests {
         let body = GeminiRequest {
             contents: vec![GeminiContent {
                 role: "user".into(),
-                parts: vec![GeminiPart {
-                    text: "Reply with exactly one word: ok".into(),
-                }],
+                parts: vec![GeminiPart::text("Reply with exactly one word: ok")],
             }],
         };
 

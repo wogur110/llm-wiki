@@ -5,12 +5,11 @@
  *
  * Checks two conditions:
  *   1. Gemini API key exists in OS Keychain  (has_api_key command)
- *   2. content-root path exists in localStorage
+ *   2. Zotero PDF folder is set (localStorage `zotero-pdf-root`)
  *
  * If either is missing → redirect to /onboarding.
- * If both are present  → restore content_root into Rust AppState
- *                        (AppState is in-memory; re-setting it here
- *                        ensures correctness after hot-reload or restart).
+ * If both are present  → restore pdf_root into Rust AppState
+ *                        (AppState is in-memory and is lost on webview reload).
  *
  * Children are not rendered until the check passes to avoid a
  * brief flash of the unauthorised page.
@@ -40,17 +39,23 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
       }
 
       try {
-        const hasKey = await invoke<boolean>('has_api_key')
-        const root   = localStorage.getItem('content-root')
+        const hasKey  = await invoke<boolean>('has_api_key')
+        const pdfRoot = localStorage.getItem('zotero-pdf-root')
 
-        if (!hasKey || !root) {
+        if (!hasKey || !pdfRoot) {
           if (!cancelled) router.replace('/onboarding')
           return
         }
 
-        // Restore Rust AppState.content_root on every page load — AppState is
-        // in-memory and is lost when the webview reloads (dev hot-reload, etc.).
-        await invoke('set_content_root', { path: root }).catch(() => {})
+        await invoke('set_pdf_root', { path: pdfRoot }).catch(() => {})
+
+        // Cache the auto-resolved AppData content root so content.ts (which
+        // reads from localStorage) can keep working unchanged.
+        const contentRoot = await invoke<string | null>('get_content_root')
+          .catch(() => null)
+        if (contentRoot) {
+          localStorage.setItem('content-root', contentRoot)
+        }
 
         if (!cancelled) setReady(true)
       } catch {

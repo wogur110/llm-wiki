@@ -31,6 +31,19 @@ type OrganizeState =
   | { kind: 'running'; done: number; total: number; current: string }
   | { kind: 'finished'; success: number; failed: number; total: number }
 
+type ImportState =
+  | { kind: 'idle' }
+  | { kind: 'scanning' }
+  | { kind: 'running'; done: number; total: number; current: string }
+  | { kind: 'finished'; success: number; failed: number; total: number }
+  | { kind: 'error'; message: string }
+
+interface PdfEntry {
+  path: string
+  stem: string
+  size_bytes: number
+}
+
 export default function DashboardPage() {
   const [categories, setCategories] = useState<CategoryInfo[]>([])
   const [recent, setRecent] = useState<PaperMeta[]>([])
@@ -38,6 +51,7 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [organize, setOrganize] = useState<OrganizeState>({ kind: 'idle' })
+  const [importState, setImportState] = useState<ImportState>({ kind: 'idle' })
 
   const refresh = useCallback(async () => {
     // Yield to the microtask queue so the first setState lands after an
@@ -115,6 +129,62 @@ export default function DashboardPage() {
     await refresh()
   }
 
+  const handleImportPdfs = async () => {
+    if (importState.kind === 'running' || importState.kind === 'scanning') return
+
+    const pdfRoot   = window.localStorage.getItem('zotero-pdf-root') ?? ''
+    const contentRoot = window.localStorage.getItem('content-root') ?? ''
+    if (!pdfRoot || !contentRoot) {
+      setImportState({
+        kind: 'error',
+        message: '온보딩에서 Zotero PDF 폴더와 위키 폴더가 설정되어야 합니다.',
+      })
+      return
+    }
+
+    setImportState({ kind: 'scanning' })
+
+    let pdfs: PdfEntry[]
+    try {
+      pdfs = await invoke<PdfEntry[]>('list_unprocessed_pdfs', {
+        pdfRoot,
+        contentRoot,
+      })
+    } catch (e) {
+      setImportState({ kind: 'error', message: String(e) })
+      return
+    }
+
+    if (pdfs.length === 0) {
+      setImportState({ kind: 'finished', success: 0, failed: 0, total: 0 })
+      return
+    }
+
+    let success = 0
+    let failed  = 0
+    for (let i = 0; i < pdfs.length; i++) {
+      const p = pdfs[i]
+      setImportState({
+        kind: 'running',
+        done: i,
+        total: pdfs.length,
+        current: p.stem,
+      })
+      try {
+        await invoke('import_pdf_and_organize', {
+          pdfPath: p.path,
+          contentRoot,
+        })
+        success++
+      } catch {
+        failed++
+      }
+    }
+
+    setImportState({ kind: 'finished', success, failed, total: pdfs.length })
+    await refresh()
+  }
+
   return (
     <div className="mx-auto max-w-6xl px-6 py-8 space-y-10">
       {/* ── Header ───────────────────────────────────────────────────── */}
@@ -137,6 +207,7 @@ export default function DashboardPage() {
           >
             새로고침
           </button>
+          <ImportPdfsButton state={importState} onClick={handleImportPdfs} />
           <OrganizeNowButton
             pendingCount={pending.length}
             state={organize}
@@ -144,6 +215,12 @@ export default function DashboardPage() {
           />
         </div>
       </header>
+
+      {importState.kind === 'error' && (
+        <div className="rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-950/40 px-4 py-3 text-sm text-red-700 dark:text-red-300">
+          PDF 가져오기 실패: {importState.message}
+        </div>
+      )}
 
       {loadError && (
         <div className="rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-950/40 px-4 py-3 text-sm text-red-700 dark:text-red-300">
@@ -319,6 +396,63 @@ function OrganizeNowButton({
       className="rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
     >
       지금 정리 ({pendingCount})
+    </button>
+  )
+}
+
+function ImportPdfsButton({
+  state,
+  onClick,
+}: {
+  state: ImportState
+  onClick: () => void
+}) {
+  if (state.kind === 'scanning') {
+    return (
+      <div className="flex items-center gap-2 rounded-lg bg-violet-600 px-3 py-1.5 text-xs font-medium text-white">
+        <span className="inline-block h-3 w-3 rounded-full border-2 border-white border-t-transparent animate-spin" />
+        <span>PDF 스캔 중…</span>
+      </div>
+    )
+  }
+
+  if (state.kind === 'running') {
+    return (
+      <div className="flex items-center gap-2 rounded-lg bg-violet-600 px-3 py-1.5 text-xs font-medium text-white">
+        <span className="inline-block h-3 w-3 rounded-full border-2 border-white border-t-transparent animate-spin" />
+        <span>
+          {state.done}/{state.total} · {state.current}
+        </span>
+      </div>
+    )
+  }
+
+  if (state.kind === 'finished') {
+    const ok = state.failed === 0
+    const label =
+      state.total === 0
+        ? '새 PDF 없음'
+        : `${ok ? '✓' : '!'} ${state.success}/${state.total}`
+    return (
+      <button
+        type="button"
+        onClick={onClick}
+        className={`rounded-lg px-3 py-1.5 text-xs font-medium text-white transition-colors ${
+          ok ? 'bg-green-600 hover:bg-green-700' : 'bg-amber-600 hover:bg-amber-700'
+        }`}
+      >
+        {label}
+      </button>
+    )
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="rounded-lg bg-violet-600 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-violet-700"
+    >
+      PDF 가져오기
     </button>
   )
 }

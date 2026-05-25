@@ -3,14 +3,17 @@
 /**
  * Mandatory onboarding page.
  *
- * Step 1 – Content folder path (text input; native picker needs
- *           @tauri-apps/plugin-dialog which is not yet installed).
+ * Step 1 – Zotero PDF folder path (the `storage/` directory Zotero uses to
+ *           keep linked attachments; PDFs are read directly from here).
  * Step 2 – Gemini API key (password field; stored in OS Keychain via
  *           the save_api_key Tauri command).
  *
+ * The wiki content folder (where generated .md files live) is auto-resolved
+ * to the Tauri AppData directory during startup and never asked for.
+ *
  * "Test Connection" must succeed before "시작하기" is enabled.
- * On start: key is saved to Keychain, content_root is persisted to
- * both localStorage and Tauri AppState, then redirects to /.
+ * On start: key is saved to Keychain, pdf_root is persisted to both
+ * localStorage and Tauri AppState, then redirects to /.
  */
 
 import { useEffect, useState } from 'react'
@@ -22,7 +25,7 @@ type TestState = 'idle' | 'loading' | 'success' | 'error'
 export default function OnboardingPage() {
   const router = useRouter()
 
-  // ── Step 1: content folder ──────────────────────────────────────────────
+  // ── Step 1: Zotero PDF folder ───────────────────────────────────────────
   const [folderPath, setFolderPath] = useState('')
 
   // ── Step 2: Gemini API key ──────────────────────────────────────────────
@@ -35,15 +38,14 @@ export default function OnboardingPage() {
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState('')
 
-  // Pre-fill from any existing config (user is reconfiguring).
-  // Async IIFE keeps setState calls off the synchronous effect body,
-  // satisfying the react-hooks/set-state-in-effect rule.
   useEffect(() => {
     ;(async () => {
-      const savedRoot = localStorage.getItem('content-root')
+      const savedPdf =
+        (await invoke<string | null>('get_pdf_root').catch(() => null)) ??
+        localStorage.getItem('zotero-pdf-root')
       const k = await invoke<string>('get_api_key').catch(() => null)
-      if (savedRoot) setFolderPath(savedRoot)
-      if (k)         setApiKey(k)
+      if (savedPdf) setFolderPath(savedPdf)
+      if (k)        setApiKey(k)
     })()
   }, [])
 
@@ -88,10 +90,9 @@ export default function OnboardingPage() {
     setSaving(true)
     setSaveError('')
     try {
-      // Ensure latest values are persisted.
       await invoke('save_api_key', { key: apiKey.trim() })
-      await invoke('set_content_root', { path: folderPath.trim() })
-      localStorage.setItem('content-root', folderPath.trim())
+      await invoke('set_pdf_root', { path: folderPath.trim() })
+      localStorage.setItem('zotero-pdf-root', folderPath.trim())
       router.replace('/')
     } catch (err) {
       setSaveError(String(err))
@@ -119,35 +120,36 @@ export default function OnboardingPage() {
 
         <div className="space-y-4">
 
-          {/* ── Step 1: Folder path ───────────────────────────────────────── */}
+          {/* ── Step 1: Zotero PDF folder ─────────────────────────────────── */}
           <section className="rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-5">
             <div className="flex items-center gap-2.5 mb-3">
               <StepBadge n={1} done={folderValid} />
               <h2 className="font-semibold text-zinc-900 dark:text-zinc-100">
-                콘텐츠 폴더
+                Zotero PDF 폴더
               </h2>
             </div>
 
             <p className="text-xs text-zinc-500 dark:text-zinc-400 mb-3 leading-relaxed">
-              논문 마크다운 파일이 저장된{' '}
+              논문 PDF가 저장된 Zotero{' '}
               <code className="rounded bg-zinc-100 dark:bg-zinc-800 px-1 py-0.5 font-mono">
-                content/
+                storage/
               </code>{' '}
-              폴더의 <strong>절대 경로</strong>를 입력하세요.
+              폴더의 <strong>절대 경로</strong>를 입력하세요. Gemini가 PDF를 읽어
+              마크다운 위키 글을 자동 생성합니다.
             </p>
 
             <input
               type="text"
               value={folderPath}
               onChange={e => setFolderPath(e.target.value)}
-              placeholder="/home/user/llm-wiki/content"
+              placeholder="C:\Users\name\Zotero\storage"
               spellCheck={false}
               className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 font-mono text-sm text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:focus:ring-blue-400"
             />
 
             {folderValid && (
               <p className="mt-1.5 text-xs text-zinc-400 font-mono truncate">
-                → {folderPath.trim()}/papers/
+                → 이 폴더의 .pdf 파일들을 자동 스캔합니다
               </p>
             )}
           </section>
@@ -245,9 +247,9 @@ export default function OnboardingPage() {
           {!canStart && !saving && (
             <p className="text-center text-xs text-zinc-400">
               {!folderValid && !keyValid
-                ? '폴더 경로와 API 키를 입력하세요'
+                ? 'Zotero PDF 폴더와 API 키를 입력하세요'
                 : !folderValid
-                  ? '폴더 경로를 입력하세요'
+                  ? 'Zotero PDF 폴더 경로를 입력하세요'
                   : !keyValid
                     ? 'API 키를 입력하세요'
                     : '연결 테스트를 먼저 완료하세요'}

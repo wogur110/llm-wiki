@@ -71,8 +71,8 @@ describe('OnboardingPage', () => {
     render(<OnboardingPage />)
     await waitFor(() => expect(mockedInvoke).toHaveBeenCalledWith('get_api_key'))
 
-    const folderInput = screen.getByPlaceholderText('/home/user/llm-wiki/content')
-    typeInto(folderInput, '/some/content/path')
+    const folderInput = screen.getByPlaceholderText(/Zotero[\\/]storage/i)
+    typeInto(folderInput, 'C:\\Users\\test\\Zotero\\storage')
 
     expect(getStartButton()).toBeDisabled()
   })
@@ -101,12 +101,11 @@ describe('OnboardingPage', () => {
     await waitFor(() => expect(mockedInvoke).toHaveBeenCalledWith('get_api_key'))
 
     typeInto(
-      screen.getByPlaceholderText('/home/user/llm-wiki/content'),
-      '/some/content/path',
+      screen.getByPlaceholderText(/Zotero[\\/]storage/i),
+      'C:\\Users\\test\\Zotero\\storage',
     )
     typeInto(screen.getByPlaceholderText('AIza…'), 'AIzaTESTKEY1234567890')
 
-    // Trigger the test_connection flow.
     fireEvent.click(screen.getByRole('button', { name: /연결 테스트/ }))
 
     await waitFor(() => {
@@ -136,8 +135,8 @@ describe('OnboardingPage', () => {
     await waitFor(() => expect(mockedInvoke).toHaveBeenCalledWith('get_api_key'))
 
     typeInto(
-      screen.getByPlaceholderText('/home/user/llm-wiki/content'),
-      '/some/content/path',
+      screen.getByPlaceholderText(/Zotero[\\/]storage/i),
+      'C:\\Users\\test\\Zotero\\storage',
     )
     typeInto(screen.getByPlaceholderText('AIza…'), 'AIzaBADKEY1234567890')
 

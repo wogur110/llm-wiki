@@ -50,11 +50,15 @@ describe('AuthGuard', () => {
     expect(screen.queryByText('child')).not.toBeInTheDocument()
   })
 
-  it('renders children when key and content-root are present', async () => {
-    localStorage.setItem('content-root', '/data/content')
-    mockedInvoke
-      .mockResolvedValueOnce(true)
-      .mockResolvedValueOnce(undefined)
+  it('renders children when key and pdf-root are present', async () => {
+    localStorage.setItem('zotero-pdf-root', '/some/zotero/storage')
+
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'has_api_key')     return true
+      if (cmd === 'set_pdf_root')    return undefined
+      if (cmd === 'get_content_root') return '/auto/content'
+      return undefined
+    })
 
     render(
       <AuthGuard>
@@ -65,8 +69,9 @@ describe('AuthGuard', () => {
     await waitFor(() => {
       expect(screen.getByText('child')).toBeInTheDocument()
     })
-    expect(mockedInvoke).toHaveBeenCalledWith('set_content_root', {
-      path: '/data/content',
+    expect(mockedInvoke).toHaveBeenCalledWith('set_pdf_root', {
+      path: '/some/zotero/storage',
     })
+    expect(localStorage.getItem('content-root')).toBe('/auto/content')
   })
 })

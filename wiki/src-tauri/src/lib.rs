@@ -2,6 +2,7 @@ pub mod content;
 pub mod gemini;
 pub mod keychain;
 pub mod organizer;
+pub mod pdf_import;
 pub mod pending_sync;
 pub mod transaction;
 pub mod zotero;
@@ -12,18 +13,20 @@ use tauri::{Emitter, Manager};
 
 /// Mutable state shared between Tauri commands and the background watcher.
 ///
-/// `content_root` is set once by the frontend after onboarding completes
-/// (`set_content_root` command).  The Zotero watcher reads it to derive the
-/// pending-sync queue path when it auto-triggers `sync_all` on reconnect.
+/// * `content_root` — auto-resolved to `<AppData>/content` on startup; markdown
+///   files written by the PDF importer live under here.  Mutable mostly for
+///   tests and the legacy `set_content_root` command.
+/// * `pdf_root` — Zotero `storage/` folder selected by the user during
+///   onboarding.  Used by `pdf_import::list_unprocessed_pdfs`.
 #[derive(Default)]
 pub struct AppState {
     pub content_root: std::sync::Mutex<Option<String>>,
+    pub pdf_root: std::sync::Mutex<Option<String>>,
 }
 
-/// Store the content-root path in app state.
-///
-/// Called by the frontend after the user selects their content folder.
-/// The path is used by the Zotero watcher to locate the pending-sync queue.
+/// Store the content-root path in app state.  Mostly used by tests and the
+/// legacy "manual content folder" workflow — the production app sets this
+/// automatically during `setup()`.
 #[tauri::command]
 fn set_content_root(
     state: tauri::State<AppState>,
@@ -41,6 +44,32 @@ fn set_content_root(
 fn get_content_root(state: tauri::State<AppState>) -> Option<String> {
     state
         .content_root
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+}
+
+/// Persist the Zotero PDF folder path selected by the user.
+///
+/// The path is validated lazily — only checked when the importer actually
+/// walks the folder — so a stale entry does not prevent app start.
+#[tauri::command]
+fn set_pdf_root(
+    state: tauri::State<AppState>,
+    path: String,
+) -> Result<(), String> {
+    *state
+        .pdf_root
+        .lock()
+        .map_err(|e| format!("State lock poisoned: {e}"))? = Some(path);
+    Ok(())
+}
+
+/// Return the Zotero PDF folder path, or `null` if onboarding has not run.
+#[tauri::command]
+fn get_pdf_root(state: tauri::State<AppState>) -> Option<String> {
+    state
+        .pdf_root
         .lock()
         .ok()
         .and_then(|g| g.clone())
@@ -130,6 +159,19 @@ pub fn run() {
                 )?;
             }
 
+            // Resolve the wiki content root to <AppData>/content on first run.
+            // The directory tree is created up-front so the PDF importer can
+            // drop files into papers/unclassified/ without extra checks.
+            if let Ok(app_data_dir) = app.path().app_data_dir() {
+                let content_root = app_data_dir.join("content");
+                let _ = std::fs::create_dir_all(content_root.join("papers").join("unclassified"));
+                let _ = std::fs::create_dir_all(content_root.join("meta"));
+
+                if let Ok(mut guard) = app.state::<AppState>().content_root.lock() {
+                    *guard = Some(content_root.to_string_lossy().into_owned());
+                }
+            }
+
             // Spawn the Zotero connectivity watcher as a long-lived background task.
             // Tauri's setup callback is not inside a Tokio runtime context, so we
             // must use tauri::async_runtime::spawn (which delegates to the Tauri-
@@ -145,6 +187,8 @@ pub fn run() {
             // ── App state ─────────────────────────────────────────────────
             set_content_root,
             get_content_root,
+            set_pdf_root,
+            get_pdf_root,
             // ── Keychain ──────────────────────────────────────────────────
             keychain::save_api_key,
             keychain::get_api_key,
@@ -154,6 +198,10 @@ pub fn run() {
             gemini::test_connection,
             gemini::call_gemini,
             gemini::classify_paper,
+            // ── PDF importer ──────────────────────────────────────────────
+            pdf_import::list_unprocessed_pdfs,
+            pdf_import::import_pdf,
+            pdf_import::import_pdf_and_organize,
             // ── Zotero ────────────────────────────────────────────────────
             zotero::check_status,
             zotero::get_item_by_doi,
