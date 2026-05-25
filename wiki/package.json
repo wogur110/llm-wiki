@@ -1,0 +1,50 @@
+{
+  "name": "wiki",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "next build && tauri build",
+    "next:dev": "next dev",
+    "next:build": "next build",
+    "tauri": "tauri",
+    "start": "next start",
+    "lint": "eslint",
+    "prebuild": "npm run wiki:backlinks && npm run wiki:search",
+    "prenext:build": "npm run wiki:backlinks && npm run wiki:search",
+    "wiki:organize": "node scripts/organize-papers.js",
+    "wiki:organize:dry": "node scripts/organize-papers.js --dry-run",
+    "wiki:watch": "node scripts/organize-papers.js --watch",
+    "wiki:backlinks": "node scripts/build-backlink-index.js",
+    "wiki:search": "node scripts/build-search-index.js"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.11.0",
+    "@tauri-apps/plugin-shell": "^2.3.5",
+    "chokidar": "^4.0.3",
+    "fuse.js": "^7.3.0",
+    "gray-matter": "^4.0.3",
+    "next": "^15.5.18",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "rehype-katex": "^7.0.1",
+    "rehype-stringify": "^10.0.1",
+    "remark": "^15.0.1",
+    "remark-html": "^16.0.1",
+    "remark-math": "^6.0.0",
+    "remark-rehype": "^11.1.2",
+    "unified": "^11.0.5"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@tauri-apps/cli": "^2.11.2",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.2.6",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}

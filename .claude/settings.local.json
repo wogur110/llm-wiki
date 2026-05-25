@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm --version)",
+      "Bash(rustc --version)",
+      "Bash(cargo --version)",
+      "Bash(export PATH=\"$HOME/.cargo/bin:$PATH\")",
+      "Bash(npm install *)",
+      "Bash(npx tauri *)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); [print\\(k,'=',v\\) for k,v in sorted\\({**d.get\\('dependencies',{}\\),**d.get\\('devDependencies',{}\\)}.items\\(\\)\\)]\")",
+      "Bash(cargo check *)"
+    ]
+  }
+}

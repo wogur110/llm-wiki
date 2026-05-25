@@ -5,4 +5,7 @@ wiki/node_modules/
 wiki/src-tauri/target/
 content/papers/.staging/
 content/meta/pending-zotero-sync.json
+content/meta/.processed-dois.json
+wiki/public/search-index.json
+wiki/public/backlinks.json
 .env*

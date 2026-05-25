@@ -1,0 +1,119 @@
+name: build
+
+# Build LLM Wiki bundles for all three desktop platforms and publish them as
+# assets on a draft GitHub Release.
+#
+# Triggers:
+#   * push to `main`          — every merge produces a fresh draft release
+#   * workflow_dispatch       — manual run from the Actions tab
+#
+# Matrix:
+#   ubuntu-latest   → .deb + .AppImage
+#   windows-latest  → .exe (NSIS installer)
+#   macos-latest    → .dmg
+#
+# All three matrix legs target the same release (tag = `app-v<version>`),
+# so the draft accumulates installers as legs finish.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # required so tauri-action can create/update a release
+
+jobs:
+  build:
+    name: ${{ matrix.platform }} (${{ matrix.bundles }})
+    runs-on: ${{ matrix.platform }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-latest
+            bundles: deb,appimage
+          - platform: windows-latest
+            bundles: nsis
+          - platform: macos-latest
+            bundles: dmg
+
+    steps:
+      # ── Source ──────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Toolchains ──────────────────────────────────────────────────────
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: wiki/package-lock.json
+
+      - name: Set up Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: wiki/src-tauri -> target
+          # Cache key is keyed off OS + tauri.conf.json + lockfile;
+          # bumping it here also invalidates if package-lock changes.
+          shared-key: ${{ matrix.platform }}-${{ matrix.bundles }}
+
+      # ── Platform-specific system dependencies ───────────────────────────
+      # Tauri 2 on Linux requires the webkit2gtk-4.1 toolchain plus the AT-SPI
+      # accessibility libs that the WebKit/GTK stack pulls in transitively.
+      # Windows + macOS runners already ship every dependency we need.
+      - name: Install Ubuntu system dependencies
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsoup-3.0-dev \
+            patchelf \
+            file
+
+      # ── Frontend ────────────────────────────────────────────────────────
+      - name: Install npm dependencies
+        working-directory: wiki
+        run: npm ci
+
+      # Static export goes to `wiki/out/`, which `tauri.conf.json`
+      # references via `build.frontendDist`.  The `prenext:build` hook
+      # regenerates `backlinks.json` + `search-index.json` first.
+      - name: Build Next.js static export
+        working-directory: wiki
+        run: npm run next:build
+
+      # ── Tauri bundle + GitHub Release ───────────────────────────────────
+      # `tauri-apps/tauri-action` invokes `tauri build`, picks up the bundles
+      # produced under `src-tauri/target/release/bundle/`, and uploads them as
+      # assets to the release identified by `tagName`.  All three matrix legs
+      # share the same tag so the draft accumulates installers.
+      - name: Build + upload (tauri-action)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: wiki
+          tagName: app-v__VERSION__
+          releaseName: 'LLM Wiki v__VERSION__'
+          releaseBody: |
+            Automated build from `${{ github.sha }}`.
+
+            Pick the installer for your platform:
+            * **Linux** — `.deb` (Debian/Ubuntu) or `.AppImage` (portable)
+            * **Windows** — `.exe` (NSIS installer)
+            * **macOS** — `.dmg` (drag to Applications)
+
+            See [README](https://github.com/${{ github.repository }}#installation) for setup.
+          releaseDraft: true
+          prerelease: false
+          args: --bundles ${{ matrix.bundles }}

@@ -1,0 +1,36 @@
+[package]
+name = "llm-wiki"
+version = "0.1.0"
+description = "LLM Wiki — Tauri 2 desktop app for research paper management"
+authors = ["Jaehyeok"]
+license = ""
+repository = ""
+edition = "2021"
+rust-version = "1.77.2"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri             = { version = "2", features = [] }
+tauri-plugin-log  = "2"
+tauri-plugin-shell = "2"
+
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+tokio      = { version = "1", features = ["full"] }
+reqwest    = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
+futures-util = "0.3"
+
+keyring  = { version = "3", features = ["async-secret-service", "tokio", "crypto-rust"] }
+chrono   = { version = "0.4", features = ["serde"] }
+
+log     = "0.4"
+anyhow  = "1"
