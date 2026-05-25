@@ -198,19 +198,33 @@ pub async fn import_pdf(
 
 /// Convenience wrapper: PDF → markdown → organiser pipeline.
 ///
+/// When `pdf_root` is provided, the organiser also waits for ZotMoov to move
+/// the physical PDF into `<pdf_root>/<category>/<original_filename>`.  Pass
+/// the same root that was used to discover the PDFs in the first place.
+///
 /// Emits the same `tx-progress` events as the existing organiser so the
 /// frontend progress UI works without changes.
 #[tauri::command]
 pub async fn import_pdf_and_organize(
     pdf_path: String,
     content_root: String,
+    pdf_root: Option<String>,
     window: tauri::WebviewWindow,
 ) -> Result<crate::organizer::ProcessResult, String> {
+    // Preserve the original PDF filename so we can compute the ZotMoov
+    // destination after classification.
+    let pdf_filename = PathBuf::from(&pdf_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_string);
+
     let imported = import_pdf(pdf_path, content_root.clone()).await?;
+
     crate::organizer::process_paper(
         imported.markdown_path,
         content_root,
-        None,
+        pdf_root,
+        pdf_filename,
         window,
     )
     .await

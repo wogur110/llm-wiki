@@ -256,6 +256,52 @@ pub async fn get_item_by_doi(doi: String) -> Result<ZoteroItem, String> {
         .ok_or_else(|| format!("No Zotero item found for DOI: {doi}"))
 }
 
+/// Look up a Zotero library item by *title*.  Used as a fallback when no DOI
+/// is available (e.g., Gemini failed to extract one from the PDF).
+///
+/// Matches case-insensitively.  Whitespace inside the title is normalised so
+/// that double-spaces and line wraps do not prevent a match.
+///
+/// # Errors
+/// * Zotero unreachable
+/// * No item whose title matches the request
+#[tauri::command]
+pub async fn get_item_by_title(title: String) -> Result<ZoteroItem, String> {
+    let client = build_client();
+    let normalised = normalise_title(&title);
+
+    let items: Vec<ZoteroItem> = client
+        .get(format!("{ZOTERO_API}/items"))
+        .query(&[("q", title.as_str()), ("qmode", "titleCreatorYear")])
+        .send()
+        .await
+        .map_err(|e| format!("Zotero unreachable: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("Zotero API error: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("JSON decode error: {e}"))?;
+
+    items
+        .into_iter()
+        .find(|item| {
+            item.data
+                .title
+                .as_deref()
+                .map(|t| normalise_title(t) == normalised)
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| format!("No Zotero item found for title: {title:?}"))
+}
+
+/// Collapse repeated whitespace into single spaces, trim, and lowercase.
+fn normalise_title(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 /// Return the *name* of the first collection the item belongs to.
 ///
 /// The name is the canonical lower-case kebab-case category string shared

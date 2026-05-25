@@ -205,6 +205,7 @@ pub fn run() {
             // ── Zotero ────────────────────────────────────────────────────
             zotero::check_status,
             zotero::get_item_by_doi,
+            zotero::get_item_by_title,
             zotero::get_current_collection,
             zotero::update_collection,
             zotero::wait_for_zotmoov,

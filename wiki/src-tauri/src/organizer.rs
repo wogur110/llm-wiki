@@ -105,6 +105,22 @@ pub struct ProcessResult {
     pub zotero_pending: bool,
 }
 
+/// How the pipeline should handle the physical PDF after classification.
+///
+/// In all branches that wait for the PDF, the wait uses
+/// [`crate::zotero::wait_for_zotmoov`], which polls for the file on disk.
+#[derive(Debug, Clone)]
+pub enum PdfMoveSpec {
+    /// Skip the PDF-confirmation step entirely.
+    None,
+    /// Wait for `path` (already fully resolved) to appear.
+    StaticPath { path: PathBuf, timeout_secs: u64 },
+    /// Wait for `root/<category>/filename` to appear, where `<category>` is
+    /// the value produced by Gemini classification at runtime.  Used by the
+    /// PDF importer when ZotMoov is configured with `subfolder = {collection}`.
+    PerCategory { root: PathBuf, filename: String, timeout_secs: u64 },
+}
+
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 /// Progress event payload — `Serialize + Clone` required by Tauri 2 `emit`.
@@ -377,7 +393,7 @@ fn update_file_frontmatter(
 pub async fn process_paper_core<F>(
     paper_path: String,
     content_root: String,
-    expected_pdf_path: Option<String>,
+    pdf_move: PdfMoveSpec,
     emit_fn: F,
     gemini_override: Option<Result<String, String>>,
 ) -> Result<ProcessResult, String>
@@ -530,16 +546,37 @@ where
     }
 
     // ──────────────────────────────────────────────────────────────────────────
-    // STEP 4  Zotero collection update  (only if DOI present)
+    // STEP 4  Zotero collection update
+    //
+    // Lookup precedence:  DOI (most reliable) → title (fallback when Gemini
+    // failed to extract a DOI).  If neither resolves to a Zotero item the
+    // step is skipped and ZotMoov confirmation is skipped along with it.
     // ──────────────────────────────────────────────────────────────────────────
-    let Some(doi) = fm.doi else {
-        // No DOI in frontmatter — skip Zotero steps gracefully.
+    emit_fn("ZoteroCollectionChanged", "started", None);
+
+    let lookup_result: Option<(crate::zotero::ZoteroItem, String)> = match &fm.doi {
+        Some(d) => match crate::zotero::get_item_by_doi(d.clone()).await {
+            Ok(i) => Some((i, format!("DOI {d}"))),
+            Err(_) if !fm.title.is_empty() => crate::zotero::get_item_by_title(fm.title.clone())
+                .await
+                .ok()
+                .map(|i| (i, format!("title fallback (DOI {d} not found)"))),
+            Err(_) => None,
+        },
+        None if !fm.title.is_empty() => crate::zotero::get_item_by_title(fm.title.clone())
+            .await
+            .ok()
+            .map(|i| (i, "title (no DOI in frontmatter)".to_string())),
+        None => None,
+    };
+
+    let Some((item, lookup_via)) = lookup_result else {
         emit_fn(
             "ZoteroCollectionChanged",
             "skipped",
-            Some("no DOI in frontmatter"),
+            Some("no Zotero item matched DOI or title"),
         );
-        emit_fn("ZotMovConfirmed", "skipped", Some("no DOI in frontmatter"));
+        emit_fn("ZotMovConfirmed", "skipped", Some("no Zotero item resolved"));
         log_success(&config, &paper_str, &category);
         return Ok(ProcessResult {
             category,
@@ -547,19 +584,6 @@ where
             zotero_synced: false,
             zotero_pending: false,
         });
-    };
-
-    emit_fn("ZoteroCollectionChanged", "started", None);
-
-    // Resolve DOI → Zotero item.
-    let item = match crate::zotero::get_item_by_doi(doi.clone()).await {
-        Ok(i) => i,
-        Err(e) => {
-            emit_fn("ZoteroCollectionChanged", "failed", Some(&e));
-            let _ = tx.rollback(&content_root_buf).await;
-            log_error(&config, &TxError::new("ZoteroCollectionChanged", &e, &paper_str));
-            return Err(format!("[ZoteroCollectionChanged] {e}"));
-        }
     };
 
     // Record previous collection for rollback.
@@ -584,26 +608,54 @@ where
         previous_collection,
         new_collection: category.clone(),
     });
-    emit_fn("ZoteroCollectionChanged", "done", None);
+    emit_fn(
+        "ZoteroCollectionChanged",
+        "done",
+        Some(&format!("via {lookup_via}")),
+    );
 
     // ──────────────────────────────────────────────────────────────────────────
-    // STEP 5  ZotMoov PDF confirmation  (only if caller provided expected path)
+    // STEP 5  ZotMoov PDF confirmation
+    //
+    // After Zotero's collection field changes, the ZotMoov plugin (when
+    // configured with `subfolder = {collection}`) physically moves the PDF
+    // attachment to `<dest>/<category>/<filename>.pdf`.  We poll for the file
+    // to appear there before declaring success — that way the user sees the
+    // PDF land in the right folder as part of one atomic-feeling action.
     // ──────────────────────────────────────────────────────────────────────────
+    let expected_pdf_path: Option<PathBuf> = match &pdf_move {
+        PdfMoveSpec::None => None,
+        PdfMoveSpec::StaticPath { path, .. } => Some(path.clone()),
+        PdfMoveSpec::PerCategory { root, filename, .. } => {
+            Some(root.join(&category).join(filename))
+        }
+    };
+
     let _zotmoov_confirmed = match expected_pdf_path {
         None => {
             emit_fn(
                 "ZotMovConfirmed",
                 "skipped",
-                Some("no expected_pdf_path provided"),
+                Some("no PDF move spec configured"),
             );
             false
         }
         Some(pdf_path) => {
-            emit_fn("ZotMovConfirmed", "started", None);
-            match crate::zotero::wait_for_zotmoov(pdf_path.clone(), 10).await {
+            emit_fn(
+                "ZotMovConfirmed",
+                "started",
+                Some(&pdf_path.to_string_lossy()),
+            );
+            let timeout = match &pdf_move {
+                PdfMoveSpec::None => 30,
+                PdfMoveSpec::StaticPath { timeout_secs, .. } => *timeout_secs,
+                PdfMoveSpec::PerCategory { timeout_secs, .. } => *timeout_secs,
+            };
+            let path_str = pdf_path.to_string_lossy().into_owned();
+            match crate::zotero::wait_for_zotmoov(path_str.clone(), timeout).await {
                 Ok(()) => {
                     tx.record_step(TxStep::ZotMovConfirmed {
-                        pdf_path: PathBuf::from(&pdf_path),
+                        pdf_path: pdf_path.clone(),
                     });
                     emit_fn("ZotMovConfirmed", "done", None);
                     true
@@ -619,7 +671,9 @@ where
     };
 
     // Record DOI + log success for fully completed pipeline.
-    let _ = record_doi_processed(&config.dois_path(), &doi, &paper_str, &category);
+    if let Some(ref doi) = fm.doi {
+        let _ = record_doi_processed(&config.dois_path(), doi, &paper_str, &category);
+    }
     log_success(&config, &paper_str, &category);
 
     Ok(ProcessResult {
@@ -634,15 +688,16 @@ where
 
 /// Organise a single paper through the full 5-step pipeline.
 ///
-/// Delegates to [`process_paper_core`] with a `window.emit` closure and no
-/// Gemini override.
-///
 /// # Parameters
-/// * `paper_path`        — absolute path to the markdown file in `unclassified/`
-/// * `content_root`      — absolute path to `content/`
-/// * `expected_pdf_path` — absolute path ZotMoov should write the PDF to (step 5);
-///                         pass `null` from JS to skip step 5
-/// * `window`            — injected by Tauri for event emission
+/// * `paper_path`     — absolute path to the markdown file in `unclassified/`
+/// * `content_root`   — absolute path to `content/`
+/// * `pdf_root`       — ZotMoov destination root (where category subfolders live).
+///                      When provided together with `pdf_filename`, the
+///                      organiser waits for `<pdf_root>/<category>/<filename>`
+///                      to appear after Zotero updates the collection.
+/// * `pdf_filename`   — original PDF filename ZotMoov should land in the
+///                      destination folder.  Ignored unless `pdf_root` is set.
+/// * `window`         — injected by Tauri for event emission
 ///
 /// # Events
 /// Emits `"tx-progress"` per step with `{step, status, detail}`.
@@ -654,13 +709,23 @@ where
 pub async fn process_paper(
     paper_path: String,
     content_root: String,
-    expected_pdf_path: Option<String>,
+    pdf_root: Option<String>,
+    pdf_filename: Option<String>,
     window: tauri::WebviewWindow,
 ) -> Result<ProcessResult, String> {
+    let pdf_move = match (pdf_root, pdf_filename) {
+        (Some(root), Some(filename)) => PdfMoveSpec::PerCategory {
+            root: PathBuf::from(root),
+            filename,
+            timeout_secs: 30,
+        },
+        _ => PdfMoveSpec::None,
+    };
+
     process_paper_core(
         paper_path,
         content_root,
-        expected_pdf_path,
+        pdf_move,
         move |step, status, detail| {
             let _ = window.emit(
                 "tx-progress",

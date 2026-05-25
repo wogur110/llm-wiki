@@ -117,7 +117,8 @@ export default function DashboardPage() {
         await invoke('process_paper', {
           paperPath: t.path,
           contentRoot,
-          expectedPdfPath: null,
+          pdfRoot: null,
+          pdfFilename: null,
         })
         success++
       } catch {
@@ -174,6 +175,7 @@ export default function DashboardPage() {
         await invoke('import_pdf_and_organize', {
           pdfPath: p.path,
           contentRoot,
+          pdfRoot,
         })
         success++
       } catch {

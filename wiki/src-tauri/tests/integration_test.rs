@@ -12,7 +12,7 @@
 //! | `test_full_transaction_rollback_on_gemini_failure` | `Err(...)` | offline | file back in unclassified/, error in log |
 //! | `test_duplicate_detection` | `Ok(...)` | offline | `Err("duplicate")`, file stays in unclassified/ |
 
-use app_lib::organizer::process_paper_core;
+use app_lib::organizer::{process_paper_core, PdfMoveSpec};
 use std::path::PathBuf;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -90,8 +90,8 @@ async fn test_full_transaction_zotero_offline() {
     let result = process_paper_core(
         paper_path.to_string_lossy().into_owned(),
         content_root.to_string_lossy().into_owned(),
-        None, // no expected PDF path
-        |_, _, _| {}, // no-op emit
+        PdfMoveSpec::None,
+        |_, _, _| {},
         Some(Ok("large-language-models".to_string())),
     )
     .await;
@@ -220,7 +220,7 @@ async fn test_full_transaction_rollback_on_gemini_failure() {
     let result = process_paper_core(
         paper_path.to_string_lossy().into_owned(),
         content_root.to_string_lossy().into_owned(),
-        None,
+        PdfMoveSpec::None,
         |_, _, _| {},
         Some(Err("simulated Gemini API failure".to_string())),
     )
@@ -357,7 +357,7 @@ async fn test_duplicate_detection() {
     let result = process_paper_core(
         paper_path.to_string_lossy().into_owned(),
         content_root.to_string_lossy().into_owned(),
-        None,
+        PdfMoveSpec::None,
         |_, _, _| {},
         Some(Ok("some-category".to_string())),
     )
@@ -424,7 +424,7 @@ Body without DOI field.
     let result = process_paper_core(
         paper_path.to_string_lossy().into_owned(),
         content_root.to_string_lossy().into_owned(),
-        None,
+        PdfMoveSpec::None,
         |_, _, _| {},
         Some(Ok("computer-vision".to_string())),
     )
