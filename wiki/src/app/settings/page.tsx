@@ -3,13 +3,13 @@
 /**
  * Settings — `/settings`
  *
- * Three sections:
- *   1. Gemini API key      (re-validates on save via `test_connection`)
- *   2. Zotero PDF folder   (where the PDF importer reads from)
- *   3. Zotero connection status + manual sync trigger
+ * Two sections:
+ *   1. Gemini API key                    (re-validates on save via `test_connection`)
+ *   2. Zotero connection + pending sync  (PDF imports happen via Zotero API)
  *
- * The wiki content folder is auto-managed under Tauri's AppData and is not
- * editable from here.
+ * The wiki content folder is auto-managed under Tauri's AppData; there is no
+ * "PDF folder" path to configure — PDFs are streamed straight from the Zotero
+ * local API.
  */
 
 import { useCallback, useEffect, useState } from 'react'
@@ -40,11 +40,6 @@ export default function SettingsPage() {
   const [keyState, setKeyState] = useState<SaveState>('idle')
   const [keyError, setKeyError] = useState('')
 
-  // ── Zotero PDF folder section ───────────────────────────────────────────
-  const [folderPath, setFolderPath] = useState('')
-  const [folderState, setFolderState] = useState<SaveState>('idle')
-  const [folderError, setFolderError] = useState('')
-
   // ── Zotero section ──────────────────────────────────────────────────────
   const [zStatus, setZStatus] = useState<ZoteroStatus>({ status: 'Disconnected' })
   const [pending, setPending] = useState<PendingSyncItem[]>([])
@@ -72,13 +67,8 @@ export default function SettingsPage() {
     let cancelled = false
     ;(async () => {
       const k = await invoke<string>('get_api_key').catch(() => '')
-      const pdfRoot =
-        (await invoke<string | null>('get_pdf_root').catch(() => null)) ??
-        window.localStorage.getItem('zotero-pdf-root') ??
-        ''
       if (cancelled) return
       setApiKey(k)
-      setFolderPath(pdfRoot)
 
       const s = await invoke<ZoteroStatus>('check_status').catch(
         () => ({ status: 'Disconnected' }) as ZoteroStatus,
@@ -132,26 +122,6 @@ export default function SettingsPage() {
     }
   }
 
-  const handleSaveFolder = async () => {
-    const trimmed = folderPath.trim()
-    if (!trimmed) {
-      setFolderState('error')
-      setFolderError('폴더 경로를 입력하세요.')
-      return
-    }
-    setFolderState('saving')
-    setFolderError('')
-    try {
-      await invoke('set_pdf_root', { path: trimmed })
-      window.localStorage.setItem('zotero-pdf-root', trimmed)
-      setFolderState('success')
-      window.setTimeout(() => setFolderState('idle'), 2500)
-    } catch (e) {
-      setFolderState('error')
-      setFolderError(String(e))
-    }
-  }
-
   const handleManualSync = async () => {
     const root = window.localStorage.getItem('content-root')
     if (!root || syncing) return
@@ -169,10 +139,12 @@ export default function SettingsPage() {
   }
 
   const handleReset = async () => {
-    if (!window.confirm('API 키와 Zotero PDF 폴더 설정을 모두 지울까요?')) return
+    if (!window.confirm('Gemini API 키와 캐시된 설정을 모두 지울까요?')) return
     try {
       await invoke('delete_api_key').catch(() => {})
     } catch {}
+    // Legacy keys from earlier versions — clear them so a re-onboarded user
+    // does not inherit stale state.
     window.localStorage.removeItem('zotero-pdf-root')
     window.localStorage.removeItem('content-root')
     router.replace('/onboarding')
@@ -186,7 +158,7 @@ export default function SettingsPage() {
           설정
         </h1>
         <p className="mt-1 text-sm text-zinc-500">
-          API 키와 콘텐츠 폴더 경로, 연동 상태를 관리합니다.
+          API 키와 Zotero 연동 상태를 관리합니다. PDF는 Zotero에서 직접 읽어옵니다.
         </p>
       </header>
 
@@ -234,45 +206,6 @@ export default function SettingsPage() {
           {keyState === 'error' && (
             <span className="text-xs font-medium text-red-500 break-all">
               ✗ {keyError}
-            </span>
-          )}
-        </div>
-      </Card>
-
-      {/* ── Zotero PDF folder ───────────────────────────────────────── */}
-      <Card
-        title="Zotero PDF 폴더"
-        subtitle="PDF 가져오기가 스캔할 Zotero storage/ 폴더 경로."
-      >
-        <input
-          type="text"
-          value={folderPath}
-          onChange={(e) => {
-            setFolderPath(e.target.value)
-            setFolderState('idle')
-            setFolderError('')
-          }}
-          placeholder="C:\Users\name\Zotero\storage"
-          spellCheck={false}
-          className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/40"
-        />
-        <div className="mt-3 flex items-center gap-3 flex-wrap">
-          <button
-            type="button"
-            onClick={handleSaveFolder}
-            disabled={folderState === 'saving' || !folderPath.trim()}
-            className="rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-blue-700 disabled:opacity-50"
-          >
-            {folderState === 'saving' ? '저장 중…' : '저장'}
-          </button>
-          {folderState === 'success' && (
-            <span className="text-xs font-medium text-green-600 dark:text-green-400">
-              ✓ 저장됨
-            </span>
-          )}
-          {folderState === 'error' && (
-            <span className="text-xs font-medium text-red-500 break-all">
-              ✗ {folderError}
             </span>
           )}
         </div>

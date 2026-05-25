@@ -4,13 +4,16 @@
 //! (no auth required — local connections only).
 //!
 //! # Tauri commands exposed
-//! | Command                  | Returns                      | Description                              |
-//! |--------------------------|------------------------------|------------------------------------------|
-//! | `check_status`           | `ZoteroStatus`               | Connectivity probe                       |
-//! | `get_item_by_doi`        | `Result<ZoteroItem, String>` | Fetch the item matching a DOI            |
-//! | `get_current_collection` | `Result<String, String>`     | Name of the item's first collection      |
-//! | `update_collection`      | `Result<(), String>`         | Move item to a named collection          |
-//! | `wait_for_zotmoov`       | `Result<(), String>`         | Block until PDF appears at expected path |
+//! | Command                          | Returns                            | Description                                          |
+//! |----------------------------------|------------------------------------|------------------------------------------------------|
+//! | `check_status`                   | `ZoteroStatus`                     | Connectivity probe                                   |
+//! | `get_item_by_doi`                | `Result<ZoteroItem, String>`       | Fetch the item matching a DOI                        |
+//! | `get_item_by_title`              | `Result<ZoteroItem, String>`       | DOI-less fallback lookup                             |
+//! | `get_current_collection`         | `Result<String, String>`           | Name of the item's first collection                  |
+//! | `update_collection`              | `Result<(), String>`               | Move item to a named collection                      |
+//! | `wait_for_zotmoov`               | `Result<(), String>`               | Block until PDF appears at expected path             |
+//! | `list_collection_pdf_items`      | `Result<Vec<ZoteroPdfEntry>, ..>`  | Items + PDF attachment in a named collection         |
+//! | `download_attachment`            | `Result<Vec<u8>, String>`          | Raw file bytes for a Zotero attachment (PDF, etc.)   |
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -61,6 +64,21 @@ pub struct ZoteroItemData {
     /// DOI string, e.g. `"10.1145/3442188.3445922"`.
     #[serde(rename = "DOI")]
     pub doi: Option<String>,
+}
+
+/// A top-level Zotero item paired with its first PDF attachment, ready to be
+/// imported.  Returned by [`list_collection_pdf_items`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ZoteroPdfEntry {
+    /// Top-level item key (used later in step 4 of the organiser pipeline).
+    pub item_key: String,
+    /// PDF attachment key — pass to [`download_attachment`].
+    pub attachment_key: String,
+    /// Display title for progress UI.
+    pub title: String,
+    /// Original filename of the PDF attachment, if Zotero exposes one.  Used
+    /// when picking a markdown filename so wikilinks match the source paper.
+    pub filename: Option<String>,
 }
 
 // ── Internal wire types ───────────────────────────────────────────────────────
@@ -256,6 +274,30 @@ pub async fn get_item_by_doi(doi: String) -> Result<ZoteroItem, String> {
         .ok_or_else(|| format!("No Zotero item found for DOI: {doi}"))
 }
 
+/// Look up a Zotero library item by its primary key.
+///
+/// Used by the Zotero-driven PDF importer so the organiser pipeline can keep
+/// working without a DOI or title heuristic (the item key is already known
+/// from listing the unclassified collection).
+///
+/// # Errors
+/// * Zotero unreachable
+/// * No item with that key exists
+#[tauri::command]
+pub async fn get_item_by_key(item_key: String) -> Result<ZoteroItem, String> {
+    let client = build_client();
+    client
+        .get(format!("{ZOTERO_API}/items/{item_key}"))
+        .send()
+        .await
+        .map_err(|e| format!("Zotero unreachable: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("Zotero API error: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("JSON decode error: {e}"))
+}
+
 /// Look up a Zotero library item by *title*.  Used as a fallback when no DOI
 /// is available (e.g., Gemini failed to extract one from the PDF).
 ///
@@ -373,6 +415,183 @@ pub async fn update_collection(
         .map_err(|e| format!("Could not update item collection: {e}"))?;
 
     Ok(())
+}
+
+/// List every top-level item in the named collection together with its first
+/// PDF attachment.  Items without a PDF child are silently skipped — they
+/// cannot be auto-imported.
+///
+/// Empty `collection` is rejected up-front to avoid accidentally enumerating
+/// the entire library.
+///
+/// # Errors
+/// * Zotero unreachable / 4xx / 5xx
+/// * Collection with the given name does not exist
+#[tauri::command]
+pub async fn list_collection_pdf_items(
+    collection: String,
+) -> Result<Vec<ZoteroPdfEntry>, String> {
+    let name = collection.trim();
+    if name.is_empty() {
+        return Err("collection name must not be empty".into());
+    }
+
+    let client = build_client();
+
+    // ── Find the collection key by name ───────────────────────────────────
+    let collections: serde_json::Value = client
+        .get(format!("{ZOTERO_API}/collections"))
+        .send()
+        .await
+        .map_err(|e| format!("Zotero unreachable: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("Zotero API error: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("JSON decode error: {e}"))?;
+
+    let col_key = collections
+        .as_array()
+        .and_then(|arr| {
+            arr.iter().find_map(|c| {
+                if c["data"]["name"].as_str() == Some(name) {
+                    c["key"].as_str().map(str::to_string)
+                } else {
+                    None
+                }
+            })
+        })
+        .ok_or_else(|| format!("Zotero collection \"{name}\" not found"))?;
+
+    // ── Top-level items in that collection ────────────────────────────────
+    let top_items: Vec<serde_json::Value> = client
+        .get(format!("{ZOTERO_API}/collections/{col_key}/items/top"))
+        .send()
+        .await
+        .map_err(|e| format!("Zotero unreachable (collection items): {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("Collection items error: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("JSON decode error: {e}"))?;
+
+    let mut out: Vec<ZoteroPdfEntry> = Vec::with_capacity(top_items.len());
+
+    for item in top_items {
+        let Some(item_key) = item["key"].as_str().map(str::to_string) else {
+            continue;
+        };
+        let title = item["data"]["title"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| item_key.clone());
+
+        if let Ok(Some(pdf)) = first_pdf_attachment(&client, &item_key).await {
+            out.push(ZoteroPdfEntry {
+                item_key,
+                attachment_key: pdf.0,
+                title,
+                filename: pdf.1,
+            });
+        }
+    }
+
+    // Stable ordering for the UI.
+    out.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+    Ok(out)
+}
+
+/// Return `(attachment_key, filename)` for the item's first PDF attachment,
+/// or `None` if the item has no PDF.  Best-effort — any HTTP failure on the
+/// children endpoint propagates as `Err`.
+async fn first_pdf_attachment(
+    client: &Client,
+    item_key: &str,
+) -> Result<Option<(String, Option<String>)>, anyhow::Error> {
+    let children: Vec<serde_json::Value> = client
+        .get(format!("{ZOTERO_API}/items/{item_key}/children"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    Ok(children.into_iter().find_map(|c| {
+        let is_pdf = c["data"]["contentType"].as_str() == Some("application/pdf");
+        if !is_pdf {
+            return None;
+        }
+        let key = c["key"].as_str()?.to_string();
+        // `filename` for imported files, `path` for linked files
+        // (which may contain "attachments:foo.pdf").
+        let filename = c["data"]["filename"]
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| {
+                c["data"]["path"]
+                    .as_str()
+                    .map(|p| p.trim_start_matches("attachments:").to_string())
+                    .and_then(|p| {
+                        std::path::PathBuf::from(p)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .map(str::to_string)
+                    })
+            });
+        Some((key, filename))
+    }))
+}
+
+/// Download an attachment's raw file bytes (PDFs, EPUBs, …) via the local API.
+///
+/// The Zotero local API serves both imported and linked attachments through
+/// the same `/items/{key}/file` endpoint, so the caller does not need to know
+/// the link mode.  Capped at 50 MB to keep memory usage predictable; if a
+/// paper is larger, fall back to ingesting it manually.
+///
+/// # Errors
+/// * Zotero unreachable or attachment missing
+/// * File exceeds 50 MB
+#[tauri::command]
+pub async fn download_attachment(attachment_key: String) -> Result<Vec<u8>, String> {
+    const MAX_BYTES: u64 = 50 * 1024 * 1024;
+
+    let client = Client::builder()
+        // Generous timeout — large papers can take a while on slow disks.
+        .timeout(Duration::from_secs(60))
+        .default_headers({
+            use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
+            let mut h = HeaderMap::new();
+            h.insert(USER_AGENT, HeaderValue::from_static("LLM-Wiki/0.1 (+tauri)"));
+            h.insert("Zotero-Allowed-Request", HeaderValue::from_static("1"));
+            h
+        })
+        .build()
+        .map_err(|e| format!("HTTP client build failed: {e}"))?;
+
+    let resp = client
+        .get(format!("{ZOTERO_API}/items/{attachment_key}/file"))
+        .send()
+        .await
+        .map_err(|e| format!("Zotero unreachable: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("Attachment download error: {e}"))?;
+
+    if let Some(len) = resp.content_length() {
+        if len > MAX_BYTES {
+            return Err(format!(
+                "Attachment is {} MB; LLM-Wiki caps single-PDF imports at 50 MB.",
+                len / (1024 * 1024)
+            ));
+        }
+    }
+
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("Could not read attachment bytes: {e}"))?;
+
+    Ok(bytes.to_vec())
 }
 
 /// Poll the filesystem until `expected_path` exists or the timeout elapses.

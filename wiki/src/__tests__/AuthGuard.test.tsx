@@ -37,7 +37,7 @@ describe('AuthGuard', () => {
     expect(mockReplace).not.toHaveBeenCalled()
   })
 
-  it('redirects to onboarding when key or root is missing', async () => {
+  it('redirects to onboarding when the API key is missing', async () => {
     mockedInvoke.mockResolvedValueOnce(false)
     render(
       <AuthGuard>
@@ -50,12 +50,9 @@ describe('AuthGuard', () => {
     expect(screen.queryByText('child')).not.toBeInTheDocument()
   })
 
-  it('renders children when key and pdf-root are present', async () => {
-    localStorage.setItem('zotero-pdf-root', '/some/zotero/storage')
-
+  it('renders children when the API key is present (no pdf-root needed)', async () => {
     mockedInvoke.mockImplementation(async (cmd: string) => {
-      if (cmd === 'has_api_key')     return true
-      if (cmd === 'set_pdf_root')    return undefined
+      if (cmd === 'has_api_key')      return true
       if (cmd === 'get_content_root') return '/auto/content'
       return undefined
     })
@@ -69,9 +66,11 @@ describe('AuthGuard', () => {
     await waitFor(() => {
       expect(screen.getByText('child')).toBeInTheDocument()
     })
-    expect(mockedInvoke).toHaveBeenCalledWith('set_pdf_root', {
-      path: '/some/zotero/storage',
-    })
     expect(localStorage.getItem('content-root')).toBe('/auto/content')
+    // set_pdf_root must NOT be called any more.
+    expect(mockedInvoke).not.toHaveBeenCalledWith(
+      'set_pdf_root',
+      expect.any(Object),
+    )
   })
 })

@@ -136,9 +136,14 @@ struct Frontmatter {
     title: String,
     abstract_text: String,
     doi: Option<String>,
+    /// Zotero library item key, injected by the PDF importer when the paper
+    /// is sourced from the Zotero local API.  When present, step 4 of the
+    /// pipeline uses this key directly instead of searching by DOI/title.
+    zotero_key: Option<String>,
 }
 
-/// Extract `title`, `abstract`, and `DOI` from a `---`-delimited YAML block.
+/// Extract `title`, `abstract`, `DOI`, and `zotero_key` from a `---`-delimited
+/// YAML block.
 ///
 /// Falls back to empty strings if the file has no frontmatter or a field is
 /// absent — Gemini can still classify from the body alone.
@@ -146,9 +151,10 @@ fn parse_frontmatter(content: &str) -> Frontmatter {
     let mut title = String::new();
     let mut abstract_text = String::new();
     let mut doi: Option<String> = None;
+    let mut zotero_key: Option<String> = None;
 
     if !content.starts_with("---") {
-        return Frontmatter { title, abstract_text, doi };
+        return Frontmatter { title, abstract_text, doi, zotero_key };
     }
 
     // Find the closing `---` (skip the opening one).
@@ -168,10 +174,15 @@ fn parse_frontmatter(content: &str) -> Frontmatter {
             if !raw.is_empty() {
                 doi = Some(raw);
             }
+        } else if let Some(v) = trimmed.strip_prefix("zotero_key:") {
+            let raw = v.trim().trim_matches('"').trim_matches('\'').to_string();
+            if !raw.is_empty() {
+                zotero_key = Some(raw);
+            }
         }
     }
 
-    Frontmatter { title, abstract_text, doi }
+    Frontmatter { title, abstract_text, doi, zotero_key }
 }
 
 /// Move a file synchronously, creating the destination directory if needed.
@@ -548,26 +559,48 @@ where
     // ──────────────────────────────────────────────────────────────────────────
     // STEP 4  Zotero collection update
     //
-    // Lookup precedence:  DOI (most reliable) → title (fallback when Gemini
-    // failed to extract a DOI).  If neither resolves to a Zotero item the
-    // step is skipped and ZotMoov confirmation is skipped along with it.
+    // Lookup precedence:
+    //   1. `zotero_key` in frontmatter (injected by the Zotero-driven importer
+    //      — fastest and unambiguous);
+    //   2. DOI (most reliable for manually-imported markdown);
+    //   3. title (fallback when Gemini failed to extract a DOI).
+    // If none resolve to a Zotero item the step is skipped and ZotMoov
+    // confirmation is skipped along with it.
     // ──────────────────────────────────────────────────────────────────────────
     emit_fn("ZoteroCollectionChanged", "started", None);
 
-    let lookup_result: Option<(crate::zotero::ZoteroItem, String)> = match &fm.doi {
-        Some(d) => match crate::zotero::get_item_by_doi(d.clone()).await {
-            Ok(i) => Some((i, format!("DOI {d}"))),
-            Err(_) if !fm.title.is_empty() => crate::zotero::get_item_by_title(fm.title.clone())
+    let lookup_result: Option<(crate::zotero::ZoteroItem, String)> = if let Some(zk) =
+        fm.zotero_key.as_ref()
+    {
+        // Hydrate the full item record so step 4 can also record the previous
+        // collection for rollback.  Falls through to DOI / title on failure
+        // (the user may have deleted the item from Zotero between import and
+        // organise).
+        match crate::zotero::get_item_by_key(zk.clone()).await {
+            Ok(i) => Some((i, format!("zotero_key {zk}"))),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    let lookup_result = match lookup_result {
+        Some(ok) => Some(ok),
+        None => match &fm.doi {
+            Some(d) => match crate::zotero::get_item_by_doi(d.clone()).await {
+                Ok(i) => Some((i, format!("DOI {d}"))),
+                Err(_) if !fm.title.is_empty() => crate::zotero::get_item_by_title(fm.title.clone())
+                    .await
+                    .ok()
+                    .map(|i| (i, format!("title fallback (DOI {d} not found)"))),
+                Err(_) => None,
+            },
+            None if !fm.title.is_empty() => crate::zotero::get_item_by_title(fm.title.clone())
                 .await
                 .ok()
-                .map(|i| (i, format!("title fallback (DOI {d} not found)"))),
-            Err(_) => None,
+                .map(|i| (i, "title (no DOI in frontmatter)".to_string())),
+            None => None,
         },
-        None if !fm.title.is_empty() => crate::zotero::get_item_by_title(fm.title.clone())
-            .await
-            .ok()
-            .map(|i| (i, "title (no DOI in frontmatter)".to_string())),
-        None => None,
     };
 
     let Some((item, lookup_via)) = lookup_result else {
@@ -771,6 +804,14 @@ mod tests {
         assert_eq!(fm.title, "Attention Is All You Need");
         assert!(fm.abstract_text.contains("architecture"));
         assert_eq!(fm.doi.as_deref(), Some("10.1234/test"));
+        assert!(fm.zotero_key.is_none());
+    }
+
+    #[test]
+    fn parse_frontmatter_extracts_zotero_key() {
+        let md = "---\ntitle: T\nabstract: A.\nzotero_key: ABCD1234\n---\n";
+        let fm = parse_frontmatter(md);
+        assert_eq!(fm.zotero_key.as_deref(), Some("ABCD1234"));
     }
 
     #[test]
@@ -778,6 +819,7 @@ mod tests {
         let fm = parse_frontmatter("plain body only");
         assert!(fm.title.is_empty());
         assert!(fm.doi.is_none());
+        assert!(fm.zotero_key.is_none());
     }
 
     #[test]

@@ -3,17 +3,17 @@
 /**
  * Mandatory onboarding page.
  *
- * Step 1 – Zotero PDF folder path (the `storage/` directory Zotero uses to
- *           keep linked attachments; PDFs are read directly from here).
- * Step 2 – Gemini API key (password field; stored in OS Keychain via
- *           the save_api_key Tauri command).
+ * Single-step setup: the user only needs a Gemini API key.  Everything else
+ * is derived at runtime:
  *
- * The wiki content folder (where generated .md files live) is auto-resolved
- * to the Tauri AppData directory during startup and never asked for.
+ *   * Wiki content folder → auto-resolved to `<AppData>/content` during
+ *     Tauri `setup()`.  Never asked for.
+ *   * PDFs to import → fetched on demand from the Zotero local API
+ *     (collection name defaults to "unclassified").  No filesystem path
+ *     is needed because Zotero is the single source of truth.
  *
  * "Test Connection" must succeed before "시작하기" is enabled.
- * On start: key is saved to Keychain, pdf_root is persisted to both
- * localStorage and Tauri AppState, then redirects to /.
+ * On start: key is saved to the OS Keychain, then redirects to /.
  */
 
 import { useEffect, useState } from 'react'
@@ -25,37 +25,24 @@ type TestState = 'idle' | 'loading' | 'success' | 'error'
 export default function OnboardingPage() {
   const router = useRouter()
 
-  // ── Step 1: Zotero PDF folder ───────────────────────────────────────────
-  const [folderPath, setFolderPath] = useState('')
-
-  // ── Step 2: Gemini API key ──────────────────────────────────────────────
   const [apiKey, setApiKey] = useState('')
   const [showKey, setShowKey] = useState(false)
   const [testState, setTestState] = useState<TestState>('idle')
   const [testError, setTestError] = useState('')
 
-  // ── Submit ──────────────────────────────────────────────────────────────
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState('')
 
   useEffect(() => {
     ;(async () => {
-      const savedPdf =
-        (await invoke<string | null>('get_pdf_root').catch(() => null)) ??
-        localStorage.getItem('zotero-pdf-root')
       const k = await invoke<string>('get_api_key').catch(() => null)
-      if (savedPdf) setFolderPath(savedPdf)
-      if (k)        setApiKey(k)
+      if (k) setApiKey(k)
     })()
   }, [])
 
-  const folderValid = folderPath.trim().length > 0
-  const keyValid    = apiKey.trim().length > 0
-  const canStart    = folderValid && keyValid && testState === 'success'
+  const keyValid = apiKey.trim().length > 0
+  const canStart = keyValid && testState === 'success'
 
-  // ── Handlers ────────────────────────────────────────────────────────────
-
-  // Reset test when key changes.
   const handleKeyChange = (v: string) => {
     setApiKey(v)
     setTestState('idle')
@@ -68,7 +55,7 @@ export default function OnboardingPage() {
     setTestError('')
     const trimmed = apiKey.trim()
     try {
-      // Validate the typed key against Gemini (does not require keychain).
+      // Validate the typed key against Gemini before persisting anything.
       await invoke<boolean>('test_connection', { apiKey: trimmed })
       try {
         await invoke('save_api_key', { key: trimmed })
@@ -91,8 +78,6 @@ export default function OnboardingPage() {
     setSaveError('')
     try {
       await invoke('save_api_key', { key: apiKey.trim() })
-      await invoke('set_pdf_root', { path: folderPath.trim() })
-      localStorage.setItem('zotero-pdf-root', folderPath.trim())
       router.replace('/')
     } catch (err) {
       setSaveError(String(err))
@@ -100,12 +85,10 @@ export default function OnboardingPage() {
     }
   }
 
-  // ── Render ───────────────────────────────────────────────────────────────
   return (
     <div className="min-h-screen flex items-center justify-center bg-zinc-50 dark:bg-zinc-950 p-6">
       <div className="w-full max-w-md">
 
-        {/* Header */}
         <div className="text-center mb-8">
           <div className="inline-flex h-12 w-12 items-center justify-center rounded-2xl bg-blue-600 text-white text-xl font-bold mb-4">
             W
@@ -114,50 +97,16 @@ export default function OnboardingPage() {
             LLM Wiki 설정
           </h1>
           <p className="text-sm text-zinc-500">
-            시작하기 전에 두 가지를 설정해주세요.
+            Gemini API 키만 있으면 시작할 수 있습니다.
           </p>
         </div>
 
         <div className="space-y-4">
 
-          {/* ── Step 1: Zotero PDF folder ─────────────────────────────────── */}
+          {/* ── Gemini API key ────────────────────────────────────────────── */}
           <section className="rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-5">
             <div className="flex items-center gap-2.5 mb-3">
-              <StepBadge n={1} done={folderValid} />
-              <h2 className="font-semibold text-zinc-900 dark:text-zinc-100">
-                Zotero PDF 폴더
-              </h2>
-            </div>
-
-            <p className="text-xs text-zinc-500 dark:text-zinc-400 mb-3 leading-relaxed">
-              논문 PDF가 저장된 Zotero{' '}
-              <code className="rounded bg-zinc-100 dark:bg-zinc-800 px-1 py-0.5 font-mono">
-                storage/
-              </code>{' '}
-              폴더의 <strong>절대 경로</strong>를 입력하세요. Gemini가 PDF를 읽어
-              마크다운 위키 글을 자동 생성합니다.
-            </p>
-
-            <input
-              type="text"
-              value={folderPath}
-              onChange={e => setFolderPath(e.target.value)}
-              placeholder="C:\Users\name\Zotero\storage"
-              spellCheck={false}
-              className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-800 px-3 py-2 font-mono text-sm text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:focus:ring-blue-400"
-            />
-
-            {folderValid && (
-              <p className="mt-1.5 text-xs text-zinc-400 font-mono truncate">
-                → 이 폴더의 .pdf 파일들을 자동 스캔합니다
-              </p>
-            )}
-          </section>
-
-          {/* ── Step 2: Gemini API key ────────────────────────────────────── */}
-          <section className="rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-5">
-            <div className="flex items-center gap-2.5 mb-3">
-              <StepBadge n={2} done={testState === 'success'} />
+              <StepBadge done={testState === 'success'} />
               <h2 className="font-semibold text-zinc-900 dark:text-zinc-100">
                 Gemini API 키
               </h2>
@@ -188,7 +137,6 @@ export default function OnboardingPage() {
               </span>
             </p>
 
-            {/* Password input */}
             <div className="relative">
               <input
                 type={showKey ? 'text' : 'password'}
@@ -207,7 +155,6 @@ export default function OnboardingPage() {
               </button>
             </div>
 
-            {/* Test connection row */}
             <div className="mt-3 flex items-center gap-3 flex-wrap">
               <button
                 type="button"
@@ -241,7 +188,20 @@ export default function OnboardingPage() {
             )}
           </section>
 
-          {/* ── Start button ──────────────────────────────────────────────── */}
+          {/* ── Zotero hint (no input — read at runtime) ─────────────────── */}
+          <section className="rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white/60 dark:bg-zinc-900/40 p-4">
+            <h3 className="text-xs font-semibold text-zinc-700 dark:text-zinc-300 mb-1.5">
+              Zotero 안내
+            </h3>
+            <p className="text-xs text-zinc-500 dark:text-zinc-400 leading-relaxed">
+              PDF는 Zotero의 <code className="rounded bg-zinc-100 dark:bg-zinc-800 px-1 py-0.5 font-mono text-[11px]">unclassified</code>{' '}
+              컬렉션에서 직접 가져옵니다. Zotero를 실행하고{' '}
+              <em>Settings → Advanced → General</em>에서{' '}
+              <em>“Allow other applications…”</em>를 켜 두세요. 폴더 경로를 따로
+              입력할 필요는 없습니다.
+            </p>
+          </section>
+
           <button
             type="button"
             onClick={handleStart}
@@ -255,16 +215,11 @@ export default function OnboardingPage() {
             ) : '시작하기 →'}
           </button>
 
-          {/* Hint text */}
           {!canStart && !saving && (
             <p className="text-center text-xs text-zinc-400">
-              {!folderValid && !keyValid
-                ? 'Zotero PDF 폴더와 API 키를 입력하세요'
-                : !folderValid
-                  ? 'Zotero PDF 폴더 경로를 입력하세요'
-                  : !keyValid
-                    ? 'API 키를 입력하세요'
-                    : '연결 테스트를 먼저 완료하세요'}
+              {!keyValid
+                ? 'API 키를 입력하세요'
+                : '연결 테스트를 먼저 완료하세요'}
             </p>
           )}
 
@@ -277,9 +232,7 @@ export default function OnboardingPage() {
   )
 }
 
-// ── Small helpers ─────────────────────────────────────────────────────────────
-
-function StepBadge({ n, done }: { n: number; done: boolean }) {
+function StepBadge({ done }: { done: boolean }) {
   return (
     <span
       className={`flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-full text-xs font-bold ${
@@ -288,7 +241,7 @@ function StepBadge({ n, done }: { n: number; done: boolean }) {
           : 'bg-blue-600 text-white'
       }`}
     >
-      {done ? '✓' : n}
+      {done ? '✓' : '1'}
     </span>
   )
 }

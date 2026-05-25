@@ -1,29 +1,47 @@
 //! PDF → markdown importer.
 //!
-//! Bridges a Zotero `storage/` folder full of PDFs and the existing
-//! `content/papers/unclassified/` workflow:
+//! There are two entry points into this module:
 //!
-//! ```text
-//!  Zotero/storage/<KEY>/paper.pdf
-//!         │
-//!         ▼   read bytes + gemini::extract_pdf_to_markdown()
-//!  content/papers/unclassified/<slug>.md
-//!         │
-//!         ▼   organizer::process_paper_core()  (existing pipeline)
-//!  content/papers/<category>/<slug>.md
-//! ```
+//! 1. **Zotero-driven (preferred)** — the importer asks Zotero for every item
+//!    in the `unclassified` collection, downloads each PDF attachment through
+//!    the local API, runs it through Gemini, and writes the resulting
+//!    markdown to `content/papers/unclassified/`.  No filesystem path needs
+//!    to be configured because Zotero is the single source of truth.
+//!
+//!    ```text
+//!     Zotero "unclassified" collection
+//!            │  GET /items/<key>/file
+//!            ▼
+//!     PDF bytes ──► gemini::extract_pdf_to_markdown
+//!            │
+//!            ▼
+//!     content/papers/unclassified/<slug>.md   (with zotero_key in frontmatter)
+//!            │
+//!            ▼  organizer::process_paper_core
+//!     content/papers/<category>/<slug>.md
+//!    ```
+//!
+//! 2. **Legacy filesystem-driven** — kept so users without Zotero can still
+//!    feed a folder of PDFs into the wiki.  See `list_unprocessed_pdfs` /
+//!    `import_pdf` below.
 //!
 //! # Tauri commands exposed
-//! | Command                  | Returns                       | Description                                          |
-//! |--------------------------|-------------------------------|------------------------------------------------------|
-//! | `list_unprocessed_pdfs`  | `Vec<PdfEntry>`               | Walk the Zotero PDF folder, skip already-imported    |
-//! | `import_pdf`             | `Result<ImportResult, String>`| Convert one PDF → markdown, drop in `unclassified/`  |
-//! | `import_pdf_and_organize`| `Result<ProcessResult, String>`| `import_pdf` + run organiser pipeline in one call   |
+//! | Command                          | Returns                          | Description                                          |
+//! |----------------------------------|----------------------------------|------------------------------------------------------|
+//! | `list_unprocessed_pdfs`          | `Vec<PdfEntry>`                  | Filesystem scan, skip already-imported               |
+//! | `import_pdf`                     | `Result<ImportResult, String>`   | One filesystem PDF → markdown                        |
+//! | `import_pdf_and_organize`        | `Result<ProcessResult, String>`  | Filesystem PDF → markdown → organiser                |
+//! | `list_zotero_unclassified`       | `Vec<ZoteroPdfImportEntry>`      | Items in `unclassified` collection minus duplicates  |
+//! | `import_zotero_item_and_organize`| `Result<ProcessResult, String>`  | Zotero item → markdown → organiser                   |
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
+
+/// Default name of the Zotero collection scanned by `list_zotero_unclassified`.
+/// Matches the CLAUDE.md folder convention (`content/papers/unclassified/`).
+pub const DEFAULT_UNCLASSIFIED_COLLECTION: &str = "unclassified";
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -230,6 +248,164 @@ pub async fn import_pdf_and_organize(
     .await
 }
 
+// ── Zotero-driven path ────────────────────────────────────────────────────────
+
+/// A Zotero item awaiting import.  Returned by `list_zotero_unclassified`.
+///
+/// `slug` is what the importer will use for the markdown filename; the
+/// frontend can compare it against existing wiki entries to deduplicate the
+/// UI list before invoking `import_zotero_item_and_organize`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZoteroPdfImportEntry {
+    pub item_key: String,
+    pub attachment_key: String,
+    pub title: String,
+    pub slug: String,
+}
+
+/// Inject `zotero_key: <key>` into the YAML frontmatter so the organiser can
+/// look the item up directly in step 4.  If Gemini's output has no
+/// frontmatter the function returns the original string unchanged — the
+/// organiser tolerates that case but it is unlikely in practice.
+fn inject_zotero_key(markdown: &str, item_key: &str) -> String {
+    if !markdown.starts_with("---\n") {
+        return markdown.to_string();
+    }
+    let after_open = &markdown[4..];
+    let Some(close_pos) = after_open.find("\n---") else {
+        return markdown.to_string();
+    };
+    let fm = &after_open[..close_pos];
+    let rest = &after_open[close_pos..]; // starts with "\n---"
+
+    // Strip any pre-existing zotero_key line to keep injection idempotent.
+    let cleaned: Vec<&str> = fm
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("zotero_key:"))
+        .collect();
+    let cleaned_fm = cleaned.join("\n");
+
+    format!("---\n{cleaned_fm}\nzotero_key: {item_key}{rest}")
+}
+
+/// List every item in the named Zotero collection that has not yet been
+/// imported into the wiki.
+///
+/// `collection` defaults to [`DEFAULT_UNCLASSIFIED_COLLECTION`] when empty.
+/// Already-imported items (by slug) are filtered out so calling this
+/// repeatedly is safe.
+#[tauri::command]
+pub async fn list_zotero_unclassified(
+    collection: Option<String>,
+    content_root: String,
+) -> Result<Vec<ZoteroPdfImportEntry>, String> {
+    let collection_name = collection
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(|| DEFAULT_UNCLASSIFIED_COLLECTION.to_string());
+
+    let raw = crate::zotero::list_collection_pdf_items(collection_name).await?;
+
+    let existing = collect_existing_markdown_stems(
+        &PathBuf::from(&content_root).join("papers"),
+    );
+
+    let mut out: Vec<ZoteroPdfImportEntry> = raw
+        .into_iter()
+        .filter_map(|entry| {
+            // Prefer the PDF filename so wikilinks match the source paper,
+            // fall back to the Zotero item title.
+            let stem_source = entry
+                .filename
+                .as_deref()
+                .map(|f| {
+                    Path::new(f)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(f)
+                        .to_string()
+                })
+                .unwrap_or_else(|| entry.title.clone());
+
+            let slug = slugify(&stem_source);
+            if slug.is_empty() || existing.contains(&slug) {
+                return None;
+            }
+            Some(ZoteroPdfImportEntry {
+                item_key: entry.item_key,
+                attachment_key: entry.attachment_key,
+                title: entry.title,
+                slug,
+            })
+        })
+        .collect();
+
+    out.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+    Ok(out)
+}
+
+/// Import a single Zotero item: download its PDF attachment, convert to
+/// markdown with Gemini, write to `content/papers/unclassified/<slug>.md` with
+/// `zotero_key` injected into the frontmatter, then run the organiser
+/// pipeline.
+///
+/// Because the importer already knows the Zotero item key, step 4 of the
+/// pipeline (collection update) uses it directly — no DOI guesswork.  The
+/// organiser is run with [`PdfMoveSpec::None`] because ZotMoov receives the
+/// authoritative signal via Zotero's collection field; LLM-Wiki does not need
+/// to verify the physical move.
+#[tauri::command]
+pub async fn import_zotero_item_and_organize(
+    item_key: String,
+    attachment_key: String,
+    content_root: String,
+    window: tauri::WebviewWindow,
+) -> Result<crate::organizer::ProcessResult, String> {
+    // ── Download the PDF bytes through the local API ──────────────────────
+    let pdf_bytes = crate::zotero::download_attachment(attachment_key.clone()).await?;
+
+    // ── Gemini PDF → markdown ─────────────────────────────────────────────
+    let markdown_raw = crate::gemini::extract_pdf_to_markdown(pdf_bytes).await?;
+    let markdown = inject_zotero_key(&markdown_raw, &item_key);
+
+    // ── Fetch metadata once so we can build a stable slug ─────────────────
+    let item = crate::zotero::get_item_by_key(item_key.clone())
+        .await
+        .map_err(|e| format!("Zotero item lookup failed: {e}"))?;
+
+    let title = item.data.title.clone().unwrap_or_else(|| item_key.clone());
+    let slug = slugify(&title);
+    let slug = if slug.is_empty() {
+        slugify(&item_key)
+    } else {
+        slug
+    };
+
+    // ── Write to unclassified/<slug>.md ───────────────────────────────────
+    let unclassified_dir = PathBuf::from(&content_root)
+        .join("papers")
+        .join("unclassified");
+    tokio::fs::create_dir_all(&unclassified_dir)
+        .await
+        .map_err(|e| format!("Cannot create unclassified/ directory: {e}"))?;
+    let md_path = unclassified_dir.join(format!("{slug}.md"));
+    tokio::fs::write(&md_path, markdown)
+        .await
+        .map_err(|e| format!("Cannot write markdown file: {e}"))?;
+
+    // ── Hand off to the organiser pipeline ────────────────────────────────
+    // pdf_root / pdf_filename are intentionally None — ZotMoov is driven by
+    // the Zotero collection change (step 4) and we trust it to move the file.
+    crate::organizer::process_paper(
+        md_path.to_string_lossy().into_owned(),
+        content_root,
+        None,
+        None,
+        window,
+    )
+    .await
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -297,5 +473,31 @@ mod tests {
             "/tmp/whatever".into(),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn inject_zotero_key_adds_field_to_frontmatter() {
+        let md = "---\ntitle: T\nabstract: A.\n---\n\nbody";
+        let out = inject_zotero_key(md, "ABCD1234");
+        assert!(out.contains("zotero_key: ABCD1234"));
+        assert!(out.contains("title: T"));
+        assert!(out.ends_with("body"));
+    }
+
+    #[test]
+    fn inject_zotero_key_is_idempotent() {
+        let md = "---\ntitle: T\nzotero_key: STALE\nabstract: A.\n---\n\nbody";
+        let out = inject_zotero_key(md, "FRESH");
+        let count = out.matches("zotero_key:").count();
+        assert_eq!(count, 1, "expected exactly one zotero_key entry: {out}");
+        assert!(out.contains("zotero_key: FRESH"));
+        assert!(!out.contains("STALE"));
+    }
+
+    #[test]
+    fn inject_zotero_key_no_frontmatter_returns_unchanged() {
+        let md = "no frontmatter here";
+        let out = inject_zotero_key(md, "ABC");
+        assert_eq!(out, md);
     }
 }

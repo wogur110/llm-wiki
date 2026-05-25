@@ -202,13 +202,18 @@ pub fn run() {
             pdf_import::list_unprocessed_pdfs,
             pdf_import::import_pdf,
             pdf_import::import_pdf_and_organize,
+            pdf_import::list_zotero_unclassified,
+            pdf_import::import_zotero_item_and_organize,
             // ── Zotero ────────────────────────────────────────────────────
             zotero::check_status,
             zotero::get_item_by_doi,
+            zotero::get_item_by_key,
             zotero::get_item_by_title,
             zotero::get_current_collection,
             zotero::update_collection,
             zotero::wait_for_zotmoov,
+            zotero::list_collection_pdf_items,
+            zotero::download_attachment,
             // ── Pending sync ──────────────────────────────────────────────
             pending_sync::enqueue,
             pending_sync::load_queue,

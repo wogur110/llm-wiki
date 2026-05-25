@@ -3,16 +3,17 @@
 /**
  * AuthGuard — runs on every Client-side navigation.
  *
- * Checks two conditions:
- *   1. Gemini API key exists in OS Keychain  (has_api_key command)
- *   2. Zotero PDF folder is set (localStorage `zotero-pdf-root`)
+ * The Zotero-driven PDF importer means the user only needs **one** thing
+ * before the app is usable:
+ *   * Gemini API key stored in OS Keychain (checked via `has_api_key`).
  *
- * If either is missing → redirect to /onboarding.
- * If both are present  → restore pdf_root into Rust AppState
- *                        (AppState is in-memory and is lost on webview reload).
+ * The wiki content folder is auto-resolved to `<AppData>/content` during
+ * Tauri `setup()` and cached into `localStorage['content-root']` here so
+ * `lib/content.ts` (which still reads from localStorage) keeps working.
  *
- * Children are not rendered until the check passes to avoid a
- * brief flash of the unauthorised page.
+ * If the key is missing → redirect to /onboarding.
+ * Children are not rendered until the check passes to avoid a brief flash
+ * of the unauthorised page.
  */
 
 import { useEffect, useState } from 'react'
@@ -27,27 +28,20 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     let cancelled = false
 
-    // Async IIFE: all setState / router calls happen after at least one
-    // await, keeping the synchronous effect body free of state mutations
-    // (satisfies react-hooks/set-state-in-effect).
     ;(async () => {
       if (pathname === '/onboarding') {
-        // Yield to the microtask queue so setReady is not synchronous.
         await Promise.resolve()
         if (!cancelled) setReady(true)
         return
       }
 
       try {
-        const hasKey  = await invoke<boolean>('has_api_key')
-        const pdfRoot = localStorage.getItem('zotero-pdf-root')
+        const hasKey = await invoke<boolean>('has_api_key')
 
-        if (!hasKey || !pdfRoot) {
+        if (!hasKey) {
           if (!cancelled) router.replace('/onboarding')
           return
         }
-
-        await invoke('set_pdf_root', { path: pdfRoot }).catch(() => {})
 
         // Cache the auto-resolved AppData content root so content.ts (which
         // reads from localStorage) can keep working unchanged.

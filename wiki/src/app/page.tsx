@@ -38,10 +38,11 @@ type ImportState =
   | { kind: 'finished'; success: number; failed: number; total: number }
   | { kind: 'error'; message: string }
 
-interface PdfEntry {
-  path: string
-  stem: string
-  size_bytes: number
+interface ZoteroPdfImportEntry {
+  item_key: string
+  attachment_key: string
+  title: string
+  slug: string
 }
 
 export default function DashboardPage() {
@@ -133,49 +134,48 @@ export default function DashboardPage() {
   const handleImportPdfs = async () => {
     if (importState.kind === 'running' || importState.kind === 'scanning') return
 
-    const pdfRoot   = window.localStorage.getItem('zotero-pdf-root') ?? ''
     const contentRoot = window.localStorage.getItem('content-root') ?? ''
-    if (!pdfRoot || !contentRoot) {
+    if (!contentRoot) {
       setImportState({
         kind: 'error',
-        message: '온보딩에서 Zotero PDF 폴더와 위키 폴더가 설정되어야 합니다.',
+        message: '위키 폴더가 초기화되지 않았습니다. 앱을 재시작해 주세요.',
       })
       return
     }
 
     setImportState({ kind: 'scanning' })
 
-    let pdfs: PdfEntry[]
+    let items: ZoteroPdfImportEntry[]
     try {
-      pdfs = await invoke<PdfEntry[]>('list_unprocessed_pdfs', {
-        pdfRoot,
-        contentRoot,
-      })
+      items = await invoke<ZoteroPdfImportEntry[]>(
+        'list_zotero_unclassified',
+        { collection: null, contentRoot },
+      )
     } catch (e) {
       setImportState({ kind: 'error', message: String(e) })
       return
     }
 
-    if (pdfs.length === 0) {
+    if (items.length === 0) {
       setImportState({ kind: 'finished', success: 0, failed: 0, total: 0 })
       return
     }
 
     let success = 0
     let failed  = 0
-    for (let i = 0; i < pdfs.length; i++) {
-      const p = pdfs[i]
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i]
       setImportState({
         kind: 'running',
         done: i,
-        total: pdfs.length,
-        current: p.stem,
+        total: items.length,
+        current: item.title,
       })
       try {
-        await invoke('import_pdf_and_organize', {
-          pdfPath: p.path,
+        await invoke('import_zotero_item_and_organize', {
+          itemKey: item.item_key,
+          attachmentKey: item.attachment_key,
           contentRoot,
-          pdfRoot,
         })
         success++
       } catch {
@@ -183,7 +183,7 @@ export default function DashboardPage() {
       }
     }
 
-    setImportState({ kind: 'finished', success, failed, total: pdfs.length })
+    setImportState({ kind: 'finished', success, failed, total: items.length })
     await refresh()
   }
 

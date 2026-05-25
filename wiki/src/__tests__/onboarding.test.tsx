@@ -1,36 +1,31 @@
 /**
  * Onboarding page tests.
  *
- * Validates the start-button gating spec from CLAUDE.md > Onboarding Rules:
+ * Validates the start-button gating spec from CLAUDE.md > Onboarding Rules
+ * (Zotero-driven flow):
  *
- *   * Folder path (Step 1) AND
- *   * Gemini API key (Step 2) AND
+ *   * Gemini API key (the only step) AND
  *   * Successful "연결 테스트" (test_connection)
  *
- * are ALL required before the "시작하기 →" button becomes enabled.  Also
- * checks that a failing test_connection surfaces an error message.
+ * must both be true before the "시작하기 →" button becomes enabled.  The PDF
+ * folder step was removed — PDFs are now fetched on demand from the Zotero
+ * local API, so onboarding no longer asks for a filesystem path.
  */
 
 import React from 'react'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 
-// ── module mocks (hoisted before component import) ───────────────────────────
-
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }))
 vi.mock('next/navigation', () => ({
   useRouter: () => ({ push: vi.fn(), replace: vi.fn() }),
 }))
 
-// Import AFTER vi.mock so the mocked invoke is in effect.
 import { invoke } from '@tauri-apps/api/core'
 import OnboardingPage from '../app/onboarding/page'
 
 const mockedInvoke = vi.mocked(invoke)
 
-// ── helpers ──────────────────────────────────────────────────────────────────
-
-/** Default invoke handler — returns null for `get_api_key` (no pre-existing key). */
 function defaultInvoke() {
   mockedInvoke.mockImplementation(async (cmd: string) => {
     if (cmd === 'get_api_key') return null
@@ -38,17 +33,13 @@ function defaultInvoke() {
   })
 }
 
-/** Convenience accessor for the gated button. */
 function getStartButton(): HTMLButtonElement {
   return screen.getByRole('button', { name: /시작하기/ }) as HTMLButtonElement
 }
 
-// Type-fence around fireEvent.change for `<input>` elements.
 function typeInto(el: HTMLElement, value: string) {
   fireEvent.change(el, { target: { value } })
 }
-
-// ── tests ────────────────────────────────────────────────────────────────────
 
 describe('OnboardingPage', () => {
   beforeEach(() => {
@@ -59,37 +50,28 @@ describe('OnboardingPage', () => {
 
   it('Start button is disabled on initial render', async () => {
     render(<OnboardingPage />)
-
-    // Wait for the async pre-fill effect (get_api_key) to settle so the
-    // button reflects the true post-mount state.
     await waitFor(() => expect(mockedInvoke).toHaveBeenCalledWith('get_api_key'))
-
     expect(getStartButton()).toBeDisabled()
   })
 
-  it('Start button stays disabled after entering folder only (no key)', async () => {
+  it('Start button stays disabled with only a key (no successful test)', async () => {
     render(<OnboardingPage />)
     await waitFor(() => expect(mockedInvoke).toHaveBeenCalledWith('get_api_key'))
 
-    const folderInput = screen.getByPlaceholderText(/Zotero[\\/]storage/i)
-    typeInto(folderInput, 'C:\\Users\\test\\Zotero\\storage')
-
+    typeInto(screen.getByPlaceholderText('AIza…'), 'AIzaTESTKEY1234567890')
     expect(getStartButton()).toBeDisabled()
   })
 
-  it('Start button stays disabled after entering key only (no folder)', async () => {
+  it('does not ask for any filesystem path', async () => {
     render(<OnboardingPage />)
     await waitFor(() => expect(mockedInvoke).toHaveBeenCalledWith('get_api_key'))
 
-    const keyInput = screen.getByPlaceholderText('AIza…')
-    typeInto(keyInput, 'AIzaTESTKEY1234567890')
-
-    expect(getStartButton()).toBeDisabled()
+    // A folder text input would have a Zotero-storage placeholder — assert
+    // the new UI does not render one.
+    expect(screen.queryByPlaceholderText(/Zotero[\\/]storage/i)).toBeNull()
   })
 
-  it('Start button is enabled after folder + key + successful test_connection', async () => {
-    // Successful test_connection — `save_api_key` and `test_connection`
-    // both resolve cleanly.
+  it('Start button enables after key + successful test_connection', async () => {
     mockedInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === 'get_api_key') return null
       if (cmd === 'save_api_key') return null
@@ -100,12 +82,7 @@ describe('OnboardingPage', () => {
     render(<OnboardingPage />)
     await waitFor(() => expect(mockedInvoke).toHaveBeenCalledWith('get_api_key'))
 
-    typeInto(
-      screen.getByPlaceholderText(/Zotero[\\/]storage/i),
-      'C:\\Users\\test\\Zotero\\storage',
-    )
     typeInto(screen.getByPlaceholderText('AIza…'), 'AIzaTESTKEY1234567890')
-
     fireEvent.click(screen.getByRole('button', { name: /연결 테스트/ }))
 
     await waitFor(() => {
@@ -114,7 +91,6 @@ describe('OnboardingPage', () => {
       })
     })
 
-    // Success badge appears AND start button becomes enabled.
     await waitFor(() => {
       expect(screen.getByText(/연결 성공/)).toBeInTheDocument()
       expect(getStartButton()).not.toBeDisabled()
@@ -122,7 +98,6 @@ describe('OnboardingPage', () => {
   })
 
   it('shows an error message when test_connection fails', async () => {
-    // test_connection rejects before save_api_key is called.
     mockedInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === 'get_api_key') return null
       if (cmd === 'test_connection') {
@@ -134,15 +109,9 @@ describe('OnboardingPage', () => {
     render(<OnboardingPage />)
     await waitFor(() => expect(mockedInvoke).toHaveBeenCalledWith('get_api_key'))
 
-    typeInto(
-      screen.getByPlaceholderText(/Zotero[\\/]storage/i),
-      'C:\\Users\\test\\Zotero\\storage',
-    )
     typeInto(screen.getByPlaceholderText('AIza…'), 'AIzaBADKEY1234567890')
-
     fireEvent.click(screen.getByRole('button', { name: /연결 테스트/ }))
 
-    // Error badge + detail message render; start button stays disabled.
     await waitFor(() => {
       expect(screen.getByText(/연결 실패/)).toBeInTheDocument()
       expect(screen.getByText(/invalid key/)).toBeInTheDocument()
