@@ -110,7 +110,9 @@ describe('OnboardingPage', () => {
     fireEvent.click(screen.getByRole('button', { name: /연결 테스트/ }))
 
     await waitFor(() => {
-      expect(mockedInvoke).toHaveBeenCalledWith('test_connection')
+      expect(mockedInvoke).toHaveBeenCalledWith('test_connection', {
+        apiKey: 'AIzaTESTKEY1234567890',
+      })
     })
 
     // Success badge appears AND start button becomes enabled.
@@ -121,11 +123,9 @@ describe('OnboardingPage', () => {
   })
 
   it('shows an error message when test_connection fails', async () => {
-    // First save_api_key succeeds (the page saves the key BEFORE calling
-    // test_connection), but test_connection itself rejects.
+    // test_connection rejects before save_api_key is called.
     mockedInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === 'get_api_key') return null
-      if (cmd === 'save_api_key') return null
       if (cmd === 'test_connection') {
         throw new Error('Gemini API: invalid key (401)')
       }

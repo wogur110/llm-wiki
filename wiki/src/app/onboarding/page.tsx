@@ -64,11 +64,19 @@ export default function OnboardingPage() {
     if (!keyValid) return
     setTestState('loading')
     setTestError('')
+    const trimmed = apiKey.trim()
     try {
-      // Save key to Keychain first — test_connection reads it from there.
-      await invoke('save_api_key', { key: apiKey.trim() })
-      await invoke<boolean>('test_connection')
-      setTestState('success')
+      // Validate the typed key against Gemini (does not require keychain).
+      await invoke<boolean>('test_connection', { apiKey: trimmed })
+      try {
+        await invoke('save_api_key', { key: trimmed })
+        setTestState('success')
+      } catch (saveErr) {
+        setTestState('error')
+        setTestError(
+          `Gemini 연결은 성공했지만 OS 키체인 저장에 실패했습니다: ${saveErr}`,
+        )
+      }
     } catch (err) {
       setTestState('error')
       setTestError(String(err))

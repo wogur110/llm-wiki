@@ -119,8 +119,8 @@ export default function SettingsPage() {
     setKeyState('saving')
     setKeyError('')
     try {
+      await invoke<boolean>('test_connection', { apiKey: trimmed })
       await invoke('save_api_key', { key: trimmed })
-      await invoke<boolean>('test_connection')
       setKeyState('success')
       window.setTimeout(() => setKeyState('idle'), 2500)
     } catch (e) {

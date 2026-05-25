@@ -134,14 +134,27 @@ fn normalise_category(raw: &str) -> String {
 
 // ── Tauri commands ─────────────────────────────────────────────────────────
 
-/// Validate the stored Gemini API key by sending a minimal API request.
+/// Validate a Gemini API key by sending a minimal API request.
+///
+/// When `api_key` is provided (onboarding / settings), that value is tested
+/// directly.  When omitted, the key is read from the OS keychain — useful for
+/// background checks after a successful save.
 ///
 /// Returns `Ok(true)` if the key is accepted, or an error string describing
 /// what went wrong (no key stored, network error, HTTP 4xx/5xx, etc.).
 #[tauri::command]
-pub async fn test_connection() -> Result<bool, String> {
-    let api_key = crate::keychain::get_key_inner()
-        .map_err(|e| format!("No API key in keychain: {e}"))?;
+pub async fn test_connection(api_key: Option<String>) -> Result<bool, String> {
+    let api_key = match api_key {
+        Some(k) => {
+            let trimmed = k.trim();
+            if trimmed.is_empty() {
+                return Err("API key must not be empty".into());
+            }
+            trimmed.to_string()
+        }
+        None => crate::keychain::get_key_inner()
+            .map_err(|e| format!("No API key in keychain: {e}"))?,
+    };
 
     let client = build_client();
     let url = format!("{API_BASE}/{MODEL}:generateContent?key={api_key}");
