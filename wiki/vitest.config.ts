@@ -36,7 +36,6 @@ export default defineConfig({
         'src/__tests__/**',
         'src/**/*.d.ts',
       ],
-      all: true,
     },
   },
   resolve: {
