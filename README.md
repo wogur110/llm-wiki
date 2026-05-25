@@ -35,10 +35,14 @@ The full project specification lives in [`CLAUDE.md`](./CLAUDE.md).
 
 ## Installation
 
-Pre-built installers are published as draft releases by the
-[`build`](./.github/workflows/build.yml) workflow.  Download the asset that
-matches your platform from
-[**Releases**](../../releases).
+Pre-built installers are published as **draft** releases by the
+[`build`](./.github/workflows/build.yml) workflow (runs on every push to
+`main`).  Download the asset for your platform from the GitHub Releases page:
+
+**https://github.com/wogur110/llm-wiki/releases**
+
+> If that page is empty, the CI build has not run yet (or only a draft exists —
+> open the latest release and expand **Assets**).  You can also [build locally](#building-a-desktop-bundle-locally).
 
 ### Linux
 
