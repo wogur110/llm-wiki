@@ -165,15 +165,27 @@ export default function OnboardingPage() {
 
             <p className="text-xs text-zinc-500 dark:text-zinc-400 mb-3 leading-relaxed">
               <a
-                href="https://aistudio.google.com"
+                href="https://aistudio.google.com/apikey"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="text-blue-500 hover:underline"
               >
-                aistudio.google.com
+                aistudio.google.com/apikey
               </a>
-              에서 무료 키를 발급받으세요.
-              OS 키체인에 안전하게 저장됩니다.
+              에서 키를 발급하세요. OS 키체인에 저장됩니다.
+              <br />
+              <span className="text-zinc-400">
+                자주 쓸 예정이면{' '}
+                <a
+                  href="https://aistudio.google.com/usage"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-blue-500 hover:underline"
+                >
+                  AI Studio → Billing
+                </a>
+                에 결제 카드 연결 → Tier 1 (2.5 Pro 5→150 RPM, 25→1,000 RPD).
+              </span>
             </p>
 
             {/* Password input */}

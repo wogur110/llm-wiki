@@ -191,7 +191,10 @@ export default function SettingsPage() {
       </header>
 
       {/* ── Gemini API key ──────────────────────────────────────────── */}
-      <Card title="Gemini API 키" subtitle="OS 키체인에 저장 후 즉시 재검증합니다.">
+      <Card
+        title="Gemini API 키"
+        subtitle="OS 키체인에 저장 후 즉시 재검증합니다. 한도 부족 시 AI Studio → Billing 에서 결제 카드를 연결하면 Tier 1로 자동 상승합니다."
+      >
         <div className="relative">
           <input
             type={showKey ? 'text' : 'password'}

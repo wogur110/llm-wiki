@@ -170,9 +170,12 @@ fn format_gemini_http_error(status: reqwest::StatusCode) -> String {
             "Gemini API 키가 거부되었습니다. AI Studio에서 키를 다시 발급받았는지 확인하세요.".into()
         }
         429 => {
-            "Gemini API 할당량 초과(429). 무료 티어는 요청 횟수·일일 한도가 낮습니다. \
-             1~2분 후 다시 시도하거나 AI Studio → Rate limits에서 한도를 확인하세요. \
-             (논문 분류는 gemini-2.5-pro를 사용합니다.)"
+            // 429는 무료 / Tier 1 / Tier 2 어떤 티어에서도 RPM·TPM·RPD 한도 초과 시 발생.
+            // 사용자의 티어를 단정하지 않고 한도 확인 경로만 안내한다.
+            "Gemini API 한도 초과(429). RPM·TPM·RPD 중 하나가 막혔습니다. \
+             현재 프로젝트의 한도는 AI Studio → Rate limits 메뉴에서 확인하고, \
+             무료 티어라면 AI Studio → Billing에서 결제 카드를 연결하면 \
+             gemini-2.5-pro 한도가 5 RPM → 150 RPM로 자동 상승합니다."
                 .into()
         }
         n => format!("Gemini API 오류: HTTP {n}"),
