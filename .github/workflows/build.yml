@@ -127,12 +127,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `bundles` is passed to `tauri build --bundles` (comma-separated).
+          # `cache-key` must NOT contain commas — swatinem/rust-cache rejects them.
           - platform: ubuntu-latest
             bundles: deb,appimage
+            cache-key: linux-deb-appimage
           - platform: windows-latest
             bundles: nsis
+            cache-key: windows-nsis
           - platform: macos-latest
             bundles: dmg
+            cache-key: macos-dmg
 
     steps:
       # ── Source ──────────────────────────────────────────────────────────
@@ -154,9 +159,8 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           workspaces: wiki/src-tauri -> target
-          # Cache key is keyed off OS + tauri.conf.json + lockfile;
-          # bumping it here also invalidates if package-lock changes.
-          shared-key: ${{ matrix.platform }}-${{ matrix.bundles }}
+          # Per-platform cache slot (no commas — required by rust-cache v2).
+          shared-key: ${{ matrix.cache-key }}
 
       # ── Platform-specific system dependencies ───────────────────────────
       # Tauri 2 on Linux requires the webkit2gtk-4.1 toolchain plus the AT-SPI
