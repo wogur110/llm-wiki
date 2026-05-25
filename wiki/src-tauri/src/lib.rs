@@ -131,8 +131,11 @@ pub fn run() {
             }
 
             // Spawn the Zotero connectivity watcher as a long-lived background task.
+            // Tauri's setup callback is not inside a Tokio runtime context, so we
+            // must use tauri::async_runtime::spawn (which delegates to the Tauri-
+            // managed Tokio runtime) instead of calling tokio::spawn directly.
             let app_handle = app.handle().clone();
-            tokio::spawn(async move {
+            tauri::async_runtime::spawn(async move {
                 zotero_watcher(app_handle).await;
             });
 
