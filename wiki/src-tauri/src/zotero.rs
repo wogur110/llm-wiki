@@ -81,8 +81,25 @@ struct ZoteroCollectionData {
 // ── Client helper ─────────────────────────────────────────────────────────────
 
 fn build_client() -> Client {
+    use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
+
+    // Zotero 7's local API blocks requests whose User-Agent starts with
+    // "Mozilla/" unless the `Zotero-Allowed-Request` header is present.
+    // reqwest's default UA does not match that pattern, but we set both
+    // headers defensively so the app keeps working even if a future
+    // dependency upgrade changes the UA shape.
+    //
+    // Reference: https://groups.google.com/g/zotero-dev/c/5KM1QVUOeck
+    let mut headers = HeaderMap::new();
+    headers.insert(USER_AGENT, HeaderValue::from_static("LLM-Wiki/0.1 (+tauri)"));
+    headers.insert(
+        "Zotero-Allowed-Request",
+        HeaderValue::from_static("1"),
+    );
+
     Client::builder()
         .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .default_headers(headers)
         .build()
         .expect("failed to build reqwest client")
 }
@@ -183,10 +200,21 @@ pub async fn check_status() -> ZoteroStatus {
         // Other transport/TLS errors.
         Err(e) => ZoteroStatus::Error(e.to_string()),
         Ok(resp) => {
-            if resp.status().is_success() {
+            let status = resp.status();
+            if status.is_success() {
                 ZoteroStatus::Connected
+            } else if status.as_u16() == 403 {
+                // Zotero is running but the local API is locked. Steer the
+                // user to the exact preference they need to flip.
+                ZoteroStatus::Error(
+                    "Zotero가 로컬 API 접근을 차단했습니다. \
+                     Zotero → Settings → Advanced → General에서 \
+                     \"Allow other applications on this computer to communicate with Zotero\"를 \
+                     체크하고 Zotero를 재시작하세요."
+                        .to_string(),
+                )
             } else {
-                ZoteroStatus::Error(format!("HTTP {}", resp.status()))
+                ZoteroStatus::Error(format!("HTTP {status}"))
             }
         }
     }
