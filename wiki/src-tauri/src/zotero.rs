@@ -342,3 +342,99 @@ pub async fn wait_for_zotmoov(
         }
     }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// When nothing is listening on localhost:23119, `check_status` must return
+    /// `ZoteroStatus::Disconnected` (not `Error`).
+    #[tokio::test]
+    async fn test_check_status_when_offline() {
+        let status = check_status().await;
+        assert!(
+            matches!(status, ZoteroStatus::Disconnected),
+            "Expected Disconnected when Zotero is not running, got {:?}",
+            status
+        );
+    }
+
+    #[test]
+    fn test_zotero_status_serialises_connected() {
+        let json = serde_json::to_string(&ZoteroStatus::Connected).unwrap();
+        assert!(json.contains("Connected"));
+        let back: ZoteroStatus = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, ZoteroStatus::Connected));
+    }
+
+    #[test]
+    fn test_zotero_item_deserialises_from_api_shape() {
+        let raw = r#"{
+            "key": "ABCD1234",
+            "data": {
+                "title": "Test Paper",
+                "abstractNote": "An abstract.",
+                "collections": ["COL1"],
+                "DOI": "10.1234/example"
+            }
+        }"#;
+        let item: ZoteroItem = serde_json::from_str(raw).unwrap();
+        assert_eq!(item.key, "ABCD1234");
+        assert_eq!(item.data.doi.as_deref(), Some("10.1234/example"));
+    }
+
+    #[tokio::test]
+    async fn test_ping_returns_false_when_offline() {
+        let client = build_client();
+        assert!(!ping(&client).await);
+    }
+
+    #[tokio::test]
+    async fn test_get_item_by_doi_when_offline() {
+        let err = get_item_by_doi("10.1234/offline-test".into())
+            .await
+            .unwrap_err();
+        assert!(err.contains("Zotero unreachable") || err.contains("Zotero API"));
+    }
+
+    #[tokio::test]
+    async fn test_get_current_collection_when_offline() {
+        let err = get_current_collection("ITEMKEY12".into())
+            .await
+            .unwrap_err();
+        assert!(err.contains("Zotero unreachable") || err.contains("Zotero API"));
+    }
+
+    #[tokio::test]
+    async fn test_update_collection_when_offline() {
+        let err = update_collection("ITEMKEY12".into(), "nlp".into())
+            .await
+            .unwrap_err();
+        assert!(err.contains("collection"));
+    }
+
+    /// `wait_for_zotmoov` must time out and return `Err` when the target path
+    /// never appears.  Uses a 2-second timeout to keep the test suite fast.
+    #[tokio::test]
+    async fn test_wait_for_zotmoov_timeout() {
+        let nonexistent = "/tmp/llm-wiki-test-nonexistent-pdf-99999.pdf";
+        let start = std::time::Instant::now();
+
+        let result = wait_for_zotmoov(nonexistent.to_string(), 2).await;
+
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "Expected Err on timeout, got Ok(())");
+        assert!(
+            elapsed.as_secs() >= 2,
+            "Timeout elapsed too fast ({elapsed:?})"
+        );
+        // Sanity-check the error message contains path info.
+        let err_msg = result.unwrap_err();
+        assert!(
+            err_msg.contains(nonexistent),
+            "Error message should mention the path: {err_msg}"
+        );
+    }
+}

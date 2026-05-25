@@ -64,3 +64,96 @@ pub fn has_api_key() -> bool {
         Err(_) => false,
     }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::{delete_key_inner, set_key_inner};
+    use super::{delete_api_key, get_api_key, has_api_key, save_api_key};
+    use std::sync::Mutex;
+
+    /// All keychain tests touch the same OS credential slot — run them serially
+    /// to prevent races between parallel test threads.
+    static KC_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Returns `true` if the OS keychain is unreachable in this environment
+    /// (e.g. WSL without a gnome-keyring / secret-service daemon).
+    /// When `true`, the calling test should skip rather than fail.
+    fn keychain_unavailable() -> bool {
+        match set_key_inner("__probe__") {
+            Ok(_) => {
+                let _ = delete_key_inner();
+                false
+            }
+            Err(_) => true,
+        }
+    }
+
+    /// Save a known value, retrieve it, assert they match.
+    #[test]
+    fn test_save_and_retrieve_key() {
+        let _g = KC_LOCK.lock().unwrap();
+        if keychain_unavailable() {
+            eprintln!("SKIP test_save_and_retrieve_key: OS keychain not available");
+            return;
+        }
+        save_api_key("test-key-abc123".to_string()).unwrap();
+        let got = get_api_key().unwrap();
+        assert_eq!(got, "test-key-abc123");
+        // Clean up so other tests start fresh.
+        let _ = delete_api_key();
+    }
+
+    /// Save then delete; `has_api_key` must return `false` afterwards.
+    #[test]
+    fn test_delete_key() {
+        let _g = KC_LOCK.lock().unwrap();
+        if keychain_unavailable() {
+            eprintln!("SKIP test_delete_key: OS keychain not available");
+            return;
+        }
+        save_api_key("to-be-deleted".to_string()).unwrap();
+        delete_api_key().unwrap();
+        assert!(!has_api_key(), "has_api_key() should be false after deletion");
+    }
+
+    /// Blank keys must be rejected before touching the OS keychain.
+    #[test]
+    fn test_save_api_key_rejects_blank() {
+        let result = save_api_key("   ".to_string());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("empty"));
+    }
+
+    /// `has_api_key` returns true after a successful save.
+    #[test]
+    fn test_has_api_key_after_save() {
+        let _g = KC_LOCK.lock().unwrap();
+        if keychain_unavailable() {
+            eprintln!("SKIP test_has_api_key_after_save: OS keychain not available");
+            return;
+        }
+        save_api_key("presence-check-key".to_string()).unwrap();
+        assert!(has_api_key());
+        let _ = delete_api_key();
+    }
+
+    /// `get_api_key` must return `Err` when no key has been stored.
+    #[test]
+    fn test_get_nonexistent_key() {
+        let _g = KC_LOCK.lock().unwrap();
+        if keychain_unavailable() {
+            eprintln!("SKIP test_get_nonexistent_key: OS keychain not available");
+            return;
+        }
+        // Ensure the slot is empty before we probe.
+        let _ = delete_api_key();
+        let result = get_api_key();
+        assert!(
+            result.is_err(),
+            "Expected Err for missing key, got Ok({:?})",
+            result.ok()
+        );
+    }
+}

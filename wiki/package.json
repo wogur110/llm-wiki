@@ -17,7 +17,15 @@
     "wiki:organize:dry": "node scripts/organize-papers.js --dry-run",
     "wiki:watch": "node scripts/organize-papers.js --watch",
     "wiki:backlinks": "node scripts/build-backlink-index.js",
-    "wiki:search": "node scripts/build-search-index.js"
+    "wiki:search": "node scripts/build-search-index.js",
+    "test:scripts": "NODE_OPTIONS=--experimental-vm-modules jest --config jest.config.js",
+    "test:frontend": "vitest run",
+    "test:frontend:watch": "vitest",
+    "test:coverage:frontend": "vitest run --coverage",
+    "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "test:coverage:rust": "cargo tarpaulin --manifest-path src-tauri/Cargo.toml --out Html --out Json --output-dir ../coverage/rust --exclude-files 'target/*' --exclude-files 'build.rs' --exclude-files 'tests/*'",
+    "test:all": "npm run test:rust && npm run test:scripts && npm run test:frontend",
+    "test:summary": "node scripts/test-summary.js"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.0",
@@ -37,14 +45,22 @@
     "unified": "^11.0.5"
   },
   "devDependencies": {
+    "@jest/globals": "^30.4.1",
     "@tailwindcss/postcss": "^4",
     "@tauri-apps/cli": "^2.11.2",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "@vitejs/plugin-react": "^4.7.0",
+    "@vitest/coverage-v8": "^4.1.7",
     "eslint": "^9",
     "eslint-config-next": "16.2.6",
+    "jest": "^30.4.2",
+    "jsdom": "^26.1.0",
     "tailwindcss": "^4",
-    "typescript": "^5"
+    "typescript": "^5",
+    "vitest": "^4.1.7"
   }
 }

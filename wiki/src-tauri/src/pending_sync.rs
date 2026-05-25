@@ -289,3 +289,92 @@ pub async fn sync_all(
 
     Ok(result)
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// Helper: absolute path string for a temporary queue file inside `dir`.
+    fn queue_path(dir: &tempfile::TempDir) -> String {
+        dir.path()
+            .join("pending-zotero-sync.json")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Enqueueing two items and then loading the queue must return both items.
+    #[test]
+    fn test_enqueue_and_load() {
+        let dir = tempdir().unwrap();
+        let qp = queue_path(&dir);
+
+        enqueue(qp.clone(), "paper1.md".into(), "AAAA0001".into(), "large-language-models".into())
+            .unwrap();
+        enqueue(qp.clone(), "paper2.md".into(), "BBBB0002".into(), "computer-vision".into())
+            .unwrap();
+
+        let items = load_queue(qp).unwrap();
+        assert_eq!(items.len(), 2, "Queue should contain 2 items");
+    }
+
+    /// After removing one item by key the queue must contain exactly one remaining item.
+    #[test]
+    fn test_remove_from_queue() {
+        let dir = tempdir().unwrap();
+        let qp = queue_path(&dir);
+
+        enqueue(qp.clone(), "paper1.md".into(), "AAAA0001".into(), "llm".into()).unwrap();
+        enqueue(qp.clone(), "paper2.md".into(), "BBBB0002".into(), "cv".into()).unwrap();
+
+        remove_from_queue(qp.clone(), "AAAA0001".into()).unwrap();
+
+        let items = load_queue(qp).unwrap();
+        assert_eq!(items.len(), 1, "Queue should contain 1 item after removal");
+        assert_eq!(
+            items[0].zotero_item_key, "BBBB0002",
+            "The remaining item should be the one that was NOT removed"
+        );
+    }
+
+    /// `has_pending` must return `false` for a fresh (empty) queue.
+    #[test]
+    fn test_has_pending_false_when_empty() {
+        let dir = tempdir().unwrap();
+        let qp = queue_path(&dir);
+        // Queue file does not exist yet — treated as empty.
+        assert!(!has_pending(qp), "Empty queue must report has_pending = false");
+    }
+
+    /// Loading a queue path that does not exist yet returns an empty list.
+    #[test]
+    fn test_load_queue_missing_file_returns_empty() {
+        let dir = tempdir().unwrap();
+        let qp = queue_path(&dir);
+        let items = load_queue(qp).unwrap();
+        assert!(items.is_empty());
+    }
+
+    /// Enqueueing the same item key twice must not duplicate entries.
+    #[test]
+    fn test_enqueue_same_key_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let qp = queue_path(&dir);
+        enqueue(qp.clone(), "paper.md".into(), "KEY123".into(), "nlp".into()).unwrap();
+        enqueue(qp.clone(), "paper.md".into(), "KEY123".into(), "nlp".into()).unwrap();
+        let items = load_queue(qp).unwrap();
+        assert_eq!(items.len(), 1);
+    }
+
+    /// `has_pending` must return `true` after enqueueing at least one item.
+    #[test]
+    fn test_has_pending_true_after_enqueue() {
+        let dir = tempdir().unwrap();
+        let qp = queue_path(&dir);
+
+        enqueue(qp.clone(), "paper.md".into(), "CCCC0003".into(), "rl".into()).unwrap();
+        assert!(has_pending(qp), "Queue with one item must report has_pending = true");
+    }
+}

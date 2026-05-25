@@ -45,15 +45,17 @@ import matter from "gray-matter";
 import chokidar from "chokidar";
 
 // ── paths ──────────────────────────────────────────────────────────────────────
+// Tests may override CONTENT_ROOT and LOG_DIR via env vars so that file
+// operations target a temp directory instead of the real project tree.
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
-const ROOT = join(__dirname, "..", "..");
-const CONTENT_ROOT = join(ROOT, "content");
-const META_DIR = join(CONTENT_ROOT, "meta");
-const PAPERS_DIR = join(CONTENT_ROOT, "papers");
-const UNCLASSIFIED = join(PAPERS_DIR, "unclassified");
-const STAGING = join(PAPERS_DIR, ".staging");
-const LOG_DIR = join(ROOT, "logs");
+const ROOT          = process.env.ORGANIZE_ROOT         ?? join(__dirname, "..", "..");
+const CONTENT_ROOT  = process.env.ORGANIZE_CONTENT_ROOT ?? join(ROOT, "content");
+const LOG_DIR       = process.env.ORGANIZE_LOG_DIR      ?? join(ROOT, "logs");
+const META_DIR      = join(CONTENT_ROOT, "meta");
+const PAPERS_DIR    = join(CONTENT_ROOT, "papers");
+const UNCLASSIFIED  = join(PAPERS_DIR, "unclassified");
+const STAGING       = join(PAPERS_DIR, ".staging");
 const PENDING_QUEUE = join(META_DIR, "pending-zotero-sync.json");
 const PROCESSED_DOIS = join(META_DIR, ".processed-dois.json");
 
@@ -218,7 +220,10 @@ async function classifyPaper(apiKey, title, abstractText) {
     .trim()
     .replace(/[`"']/g, "")
     .toLowerCase()
-    .replace(/\s+/g, "-");
+    .replace(/[\s_/\\]+/g, "-")   // spaces, underscores, slashes → hyphens
+    .replace(/[^a-z0-9-]/g, "")  // strip remaining non-kebab characters
+    .replace(/-+/g, "-")          // collapse consecutive hyphens
+    .replace(/^-|-$/g, "");       // strip leading/trailing hyphens
   if (!category) throw new Error("Gemini returned empty category");
   if (!/^[a-z0-9][a-z0-9-]*$/.test(category)) {
     throw new Error(`Gemini returned invalid category: "${category}"`);
@@ -511,18 +516,37 @@ function runWatch(apiKey) {
 }
 
 // ── main ───────────────────────────────────────────────────────────────────────
+// Guard: skip execution when this file is imported as a module (e.g. by tests).
+// `import.meta.url` is the file:// URL of this script; `process.argv[1]` is the
+// path Node received on the command line.  They match only when run directly.
 
-const apiKey = process.env.GEMINI_API_KEY;
-if (!apiKey && !DRY_RUN) {
-  console.error(
-    "GEMINI_API_KEY not set.  Export it for standalone use, or run with --dry-run."
-  );
-  process.exit(1);
+const isMain = Boolean(
+  process.argv[1] &&
+    fileURLToPath(import.meta.url) === process.argv[1]
+);
+
+if (isMain) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey && !DRY_RUN) {
+    console.error(
+      "GEMINI_API_KEY not set.  Export it for standalone use, or run with --dry-run."
+    );
+    process.exit(1);
+  }
+
+  if (WATCH) {
+    runWatch(apiKey ?? "");
+  } else {
+    const targets = SINGLE_FILE ? [SINGLE_FILE] : listUnclassified();
+    await runBatch(targets, apiKey ?? "");
+  }
 }
 
-if (WATCH) {
-  runWatch(apiKey ?? "");
-} else {
-  const targets = SINGLE_FILE ? [SINGLE_FILE] : listUnclassified();
-  await runBatch(targets, apiKey ?? "");
-}
+// ── exports (consumed by unit tests) ───────────────────────────────────────────
+export {
+  normalizeDoi,
+  extractDoi,
+  hashDoi,
+  Limiter,
+  classifyPaper,
+};

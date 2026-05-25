@@ -349,3 +349,182 @@ pub fn read_backlinks(content_root: String) -> Result<String, String> {
     }
     fs::read_to_string(&path).map_err(|e| format!("read failed: {e}"))
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Fixture with two classified categories for cross-folder scans.
+    fn fixture_multi_category() -> (TempDir, String) {
+        let (dir, root) = fixture_root();
+        let cv = PathBuf::from(&root)
+            .join("papers")
+            .join("computer-vision");
+        fs::create_dir_all(&cv).unwrap();
+        fs::write(
+            cv.join("resnet.md"),
+            "---\ntitle: ResNet\nyear: 2015\n---\n\nCNN body.",
+        )
+        .unwrap();
+        (dir, root)
+    }
+
+    /// Build a minimal `content/` tree and return the content-root path.
+    fn fixture_root() -> (TempDir, String) {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path().join("content");
+        let papers = root.join("papers");
+        let cat = papers.join("large-language-models");
+        let uncl = papers.join("unclassified");
+        fs::create_dir_all(&cat).unwrap();
+        fs::create_dir_all(&uncl).unwrap();
+        fs::create_dir_all(root.join("meta")).unwrap();
+
+        fs::write(
+            cat.join("attention.md"),
+            "---\ntitle: Attention Is All You Need\nyear: 2017\n---\n\nBody text.",
+        )
+        .unwrap();
+        fs::write(
+            cat.join("bert.md"),
+            "No frontmatter here — plain body only.",
+        )
+        .unwrap();
+        fs::write(uncl.join("draft.md"), "---\ntitle: Draft\n---\n").unwrap();
+        fs::write(
+            root.join("meta").join("backlinks.json"),
+            r#"{"attention":["bert"]}"#,
+        )
+        .unwrap();
+
+        (dir, root.to_string_lossy().to_string())
+    }
+
+    #[test]
+    fn extract_frontmatter_block_parses_yaml() {
+        let md = "---\ntitle: Foo\nyear: 2024\n---\n\nBody";
+        assert_eq!(extract_frontmatter_block(md), "title: Foo\nyear: 2024");
+    }
+
+    #[test]
+    fn extract_frontmatter_block_empty_when_missing() {
+        assert_eq!(extract_frontmatter_block("no frontmatter"), "");
+        assert_eq!(extract_frontmatter_block("---\nunclosed"), "");
+    }
+
+    #[test]
+    fn is_user_category_excludes_system_folders() {
+        assert!(is_user_category("large-language-models"));
+        assert!(!is_user_category("unclassified"));
+        assert!(!is_user_category(".staging"));
+        assert!(!is_user_category(".hidden"));
+    }
+
+    #[test]
+    fn list_categories_returns_sorted_user_categories() {
+        let (_dir, root) = fixture_root();
+        let cats = list_categories(root).unwrap();
+        assert_eq!(cats.len(), 1);
+        assert_eq!(cats[0].name, "large-language-models");
+        assert_eq!(cats[0].paper_count, 2);
+        assert!(cats[0].latest_paper_date.is_some());
+    }
+
+    #[test]
+    fn list_papers_in_category_returns_frontmatter() {
+        let (_dir, root) = fixture_root();
+        let papers = list_papers_in_category(root, "large-language-models".into()).unwrap();
+        assert_eq!(papers.len(), 2);
+        let attention = papers.iter().find(|p| p.slug == "attention").unwrap();
+        assert!(attention.frontmatter.contains("title: Attention"));
+        assert!(!attention.created_at.is_empty());
+    }
+
+    #[test]
+    fn list_recent_papers_respects_limit() {
+        let (_dir, root) = fixture_root();
+        let recent = list_recent_papers(root, 1).unwrap();
+        assert_eq!(recent.len(), 1);
+    }
+
+    #[test]
+    fn list_recent_papers_scans_every_category() {
+        let (_dir, root) = fixture_multi_category();
+        let recent = list_recent_papers(root, 10).unwrap();
+        assert_eq!(recent.len(), 3);
+        let slugs: Vec<_> = recent.iter().map(|p| p.slug.as_str()).collect();
+        assert!(slugs.contains(&"attention"));
+        assert!(slugs.contains(&"resnet"));
+    }
+
+    #[test]
+    fn read_paper_file_returns_full_content() {
+        let (_dir, root) = fixture_root();
+        let paper = read_paper_file(root, "large-language-models".into(), "attention".into())
+            .unwrap();
+        assert_eq!(paper.slug, "attention");
+        assert!(paper.content.contains("Body text."));
+    }
+
+    #[test]
+    fn find_paper_category_locates_slug() {
+        let (_dir, root) = fixture_root();
+        let cat = find_paper_category(root, "attention".into()).unwrap();
+        assert_eq!(cat, "large-language-models");
+    }
+
+    #[test]
+    fn find_paper_category_finds_second_category() {
+        let (_dir, root) = fixture_multi_category();
+        let cat = find_paper_category(root, "resnet".into()).unwrap();
+        assert_eq!(cat, "computer-vision");
+    }
+
+    #[test]
+    fn list_papers_in_category_errors_for_missing_dir() {
+        let (_dir, root) = fixture_root();
+        assert!(list_papers_in_category(root, "no-such-category".into()).is_err());
+    }
+
+    #[test]
+    fn find_paper_category_errors_when_missing() {
+        let (_dir, root) = fixture_root();
+        assert!(find_paper_category(root, "nonexistent".into()).is_err());
+    }
+
+    #[test]
+    fn list_unclassified_lists_pending_files() {
+        let (_dir, root) = fixture_root();
+        let pending = list_unclassified(root).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].name, "draft.md");
+    }
+
+    #[test]
+    fn read_backlinks_returns_json() {
+        let (_dir, root) = fixture_root();
+        let json = read_backlinks(root).unwrap();
+        assert!(json.contains("attention"));
+    }
+
+    #[test]
+    fn list_categories_errors_when_papers_dir_missing() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("content");
+        fs::create_dir_all(&root).unwrap();
+        assert!(list_categories(root.to_string_lossy().to_string()).is_err());
+    }
+
+    #[test]
+    fn read_backlinks_missing_file_returns_empty_object() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("content");
+        fs::create_dir_all(root.join("meta")).unwrap();
+        let json = read_backlinks(root.to_string_lossy().to_string()).unwrap();
+        assert_eq!(json, "{}");
+    }
+}

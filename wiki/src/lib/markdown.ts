@@ -24,6 +24,33 @@ import type { Root, Text, Link, PhrasingContent, Parent } from 'mdast'
 const WIKILINK_RE = /\[\[([^\]|#]+?)(?:#[^\]|]*)?(?:\|([^\]]+))?\]\]/g
 
 /**
+ * Normalise a wikilink target into a lower-case kebab-case slug.
+ *
+ *   "SomePaper"      → "some-paper"
+ *   "Missing Paper"  → "missing-paper"
+ *   "attention.md"   → "attention"
+ *   "Already-Kebab"  → "already-kebab"
+ *
+ * The wider wiki guarantees every paper filename is kebab-case
+ * (see CLAUDE.md > Category Mapping Rules), so funnelling everything
+ * through the same normaliser keeps href generation consistent.
+ */
+export function slugifyWikilink(raw: string): string {
+  return raw
+    .trim()
+    .replace(/\.md$/i, '')
+    // camelCase / PascalCase boundary → `Foo-Bar`
+    .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
+    // consecutive uppercase runs e.g. `HTTPServer` → `HTTP-Server`
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1-$2')
+    .toLowerCase()
+    // collapse spaces / underscores / dots / slashes into a single hyphen
+    .replace(/[\s_./]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+}
+
+/**
  * Remark plugin that walks every text node and splits embedded `[[wikilink]]`
  * references into proper link nodes pointing at `/papers/<slug>`.
  */
@@ -47,12 +74,12 @@ const remarkWikilinks: Plugin<[], Root> = () => {
           pieces.push({ type: 'text', value: value.slice(lastEnd, start) })
         }
 
-        const slug = rawSlug.trim().replace(/\.md$/i, '')
-        const display = (label?.trim() || slug).trim()
+        const slug = slugifyWikilink(rawSlug)
+        const display = (label?.trim() || rawSlug.trim().replace(/\.md$/i, '')).trim()
 
         const link: Link = {
           type: 'link',
-          url: `/papers/${encodeURIComponent(slug)}`,
+          url: `/papers/${slug}`,
           title: null,
           children: [{ type: 'text', value: display }],
           data: { hProperties: { className: ['wikilink'], 'data-slug': slug } },

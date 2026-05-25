@@ -177,3 +177,16 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+#[cfg(test)]
+mod state_tests {
+    use super::AppState;
+
+    #[test]
+    fn app_state_stores_content_root() {
+        let state = AppState::default();
+        *state.content_root.lock().unwrap() = Some("/data/content".into());
+        let got = state.content_root.lock().unwrap().clone();
+        assert_eq!(got.as_deref(), Some("/data/content"));
+    }
+}

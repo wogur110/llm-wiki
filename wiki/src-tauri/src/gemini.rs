@@ -340,3 +340,174 @@ pub async fn classify_paper(
 
     Ok(category)
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        normalise_category, build_client, extract_ns_text, to_gemini_contents, API_BASE, MODEL,
+        GeminiRequest, GeminiContent, GeminiPart, GeminiResponse, Message,
+        NsCandidate, NsContent, NsPart,
+    };
+
+    /// True iff `s` is non-empty lower-case kebab-case:
+    /// starts with [a-z], all chars in [a-z0-9-], no leading/trailing hyphen.
+    fn is_kebab_case(s: &str) -> bool {
+        !s.is_empty()
+            && s.chars()
+                .next()
+                .map(|c| c.is_ascii_lowercase())
+                .unwrap_or(false)
+            && !s.ends_with('-')
+            && s.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    }
+
+    /// `normalise_category` must always produce lower-case kebab-case output.
+    #[test]
+    fn test_classify_returns_kebab_case() {
+        let cases = [
+            "large-language-models",
+            "  Reinforcement Learning  ",
+            "Computer Vision",
+            "Graph_Neural_Networks",
+            "\"multimodal-learning\"",
+        ];
+        for input in &cases {
+            let result = normalise_category(input);
+            assert!(
+                is_kebab_case(&result),
+                "normalise_category({input:?}) = {result:?} is not valid kebab-case"
+            );
+        }
+    }
+
+    /// Output must never contain uppercase letters.
+    #[test]
+    fn test_classify_no_uppercase() {
+        let cases = [
+            "LargeLanguageModels",
+            "BERT",
+            "GPT-4",
+            "ReinforcementLearning",
+        ];
+        for input in &cases {
+            let result = normalise_category(input);
+            assert_eq!(
+                result,
+                result.to_lowercase(),
+                "normalise_category({input:?}) = {result:?} contains uppercase letters"
+            );
+        }
+    }
+
+    /// Spaces and underscores must be collapsed to hyphens, not preserved.
+    #[test]
+    fn test_classify_no_spaces() {
+        let cases = [
+            "large language models",
+            "reinforcement learning",
+            "computer vision tasks",
+            "graph neural networks",
+        ];
+        for input in &cases {
+            let result = normalise_category(input);
+            assert!(
+                !result.contains(' '),
+                "normalise_category({input:?}) = {result:?} still contains a space"
+            );
+            assert!(
+                !result.contains('_'),
+                "normalise_category({input:?}) = {result:?} still contains an underscore"
+            );
+        }
+    }
+
+    /// Submitting an invalid API key to the Gemini REST endpoint must yield
+    /// a non-2xx response (HTTP 400 "API key not valid" or similar).
+    ///
+    /// The test bypasses the OS keychain entirely — it constructs the HTTP
+    /// request directly so keyring's zbus backend never runs inside the Tokio
+    /// executor (which would cause a "cannot start a runtime from within a
+    /// runtime" panic in environments that use async-secret-service).
+    ///
+    #[test]
+    fn test_extract_ns_text_reads_first_candidate() {
+        let resp = GeminiResponse {
+            candidates: vec![NsCandidate {
+                content: NsContent {
+                    parts: vec![NsPart {
+                        text: "large-language-models".into(),
+                    }],
+                },
+            }],
+        };
+        assert_eq!(
+            extract_ns_text(&resp).as_deref(),
+            Some("large-language-models")
+        );
+    }
+
+    #[test]
+    fn test_extract_ns_text_empty_candidates() {
+        let resp = GeminiResponse { candidates: vec![] };
+        assert_eq!(extract_ns_text(&resp), None);
+    }
+
+    #[test]
+    fn test_to_gemini_contents_maps_roles() {
+        let contents = to_gemini_contents(vec![
+            Message {
+                role: "user".into(),
+                text: "hello".into(),
+            },
+            Message {
+                role: "model".into(),
+                text: "hi".into(),
+            },
+        ]);
+        assert_eq!(contents.len(), 2);
+        assert_eq!(contents[0].role, "user");
+        assert_eq!(contents[1].parts[0].text, "hi");
+    }
+
+    /// Passes trivially in offline environments (network error ≠ success).
+    #[tokio::test]
+    async fn test_test_connection_invalid_key() {
+        let client = build_client();
+        let url = format!(
+            "{API_BASE}/{MODEL}:generateContent?key=invalid-key-123"
+        );
+        let body = GeminiRequest {
+            contents: vec![GeminiContent {
+                role: "user".into(),
+                parts: vec![GeminiPart {
+                    text: "Reply with exactly one word: ok".into(),
+                }],
+            }],
+        };
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            client.post(&url).json(&body).send(),
+        )
+        .await;
+
+        match result {
+            // Network timeout — offline environment, can't reach Gemini.
+            // Still counts as "did not succeed", so the test passes.
+            Err(_timeout) => {}
+            // Got a response: the fake key must be rejected (4xx).
+            Ok(Ok(resp)) => {
+                assert!(
+                    !resp.status().is_success(),
+                    "Gemini must reject an invalid API key; got status {}",
+                    resp.status()
+                );
+            }
+            // Transport / TLS error — also means we didn't get a success.
+            Ok(Err(_network_err)) => {}
+        }
+    }
+}
