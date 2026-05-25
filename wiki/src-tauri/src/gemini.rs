@@ -23,6 +23,8 @@ use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 
 const MODEL: &str = "gemini-2.5-pro";
+/// Lighter model for key validation only — higher free-tier RPM than 2.5 Pro.
+const TEST_MODEL: &str = "gemini-2.5-flash";
 const API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 /// Hard timeout for a single HTTP request (streaming included).
 const REQUEST_TIMEOUT_SECS: u64 = 180;
@@ -132,6 +134,22 @@ fn normalise_category(raw: &str) -> String {
         .join("-")
 }
 
+/// User-facing HTTP error text — never include the request URL (it embeds the API key).
+fn format_gemini_http_error(status: reqwest::StatusCode) -> String {
+    match status.as_u16() {
+        401 | 403 => {
+            "Gemini API 키가 거부되었습니다. AI Studio에서 키를 다시 발급받았는지 확인하세요.".into()
+        }
+        429 => {
+            "Gemini API 할당량 초과(429). 무료 티어는 요청 횟수·일일 한도가 낮습니다. \
+             1~2분 후 다시 시도하거나 AI Studio → Rate limits에서 한도를 확인하세요. \
+             (논문 분류는 gemini-2.5-pro를 사용합니다.)"
+                .into()
+        }
+        n => format!("Gemini API 오류: HTTP {n}"),
+    }
+}
+
 // ── Tauri commands ─────────────────────────────────────────────────────────
 
 /// Validate a Gemini API key by sending a minimal API request.
@@ -157,7 +175,8 @@ pub async fn test_connection(api_key: Option<String>) -> Result<bool, String> {
     };
 
     let client = build_client();
-    let url = format!("{API_BASE}/{MODEL}:generateContent?key={api_key}");
+    // Use Flash for the probe so onboarding tests do not burn 2.5 Pro quota.
+    let url = format!("{API_BASE}/{TEST_MODEL}:generateContent?key={api_key}");
 
     let body = GeminiRequest {
         contents: vec![GeminiContent {
@@ -169,14 +188,17 @@ pub async fn test_connection(api_key: Option<String>) -> Result<bool, String> {
         }],
     };
 
-    client
+    let resp = client
         .post(&url)
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("Network error: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("Gemini API error: {e}"))?;
+        .map_err(|e| format!("Network error: {e}"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format_gemini_http_error(status));
+    }
 
     Ok(true)
 }
