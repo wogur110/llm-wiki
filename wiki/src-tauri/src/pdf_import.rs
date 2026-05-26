@@ -31,7 +31,8 @@
 //! | `list_unprocessed_pdfs`          | `Vec<PdfEntry>`                  | Filesystem scan, skip already-imported               |
 //! | `import_pdf`                     | `Result<ImportResult, String>`   | One filesystem PDF → markdown                        |
 //! | `import_pdf_and_organize`        | `Result<ProcessResult, String>`  | Filesystem PDF → markdown → organiser                |
-//! | `list_zotero_unclassified`       | `Vec<ZoteroPdfImportEntry>`      | Items in `unclassified` collection minus duplicates  |
+//! | `list_zotero_unclassified`       | `Vec<ZoteroPdfImportEntry>`      | Items in `Unclassified` collection minus duplicates  |
+//! | `list_zotero_all`                | `Vec<ZoteroPdfImportEntry>`      | Every top-level item in the library minus duplicates |
 //! | `import_zotero_item_and_organize`| `Result<ProcessResult, String>`  | Zotero item → markdown → organiser                   |
 
 use serde::{Deserialize, Serialize};
@@ -40,8 +41,13 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 /// Default name of the Zotero collection scanned by `list_zotero_unclassified`.
-/// Matches the CLAUDE.md folder convention (`content/papers/unclassified/`).
-pub const DEFAULT_UNCLASSIFIED_COLLECTION: &str = "unclassified";
+///
+/// Matches the case the user gave the collection in Zotero itself
+/// (capital-U "Unclassified") — the local API enforces exact string equality
+/// on `data.name`, so an all-lowercase fallback would fail to find it.  The
+/// filesystem folder under `content/papers/unclassified/` stays lowercase
+/// per the CLAUDE.md kebab-case rule.
+pub const DEFAULT_UNCLASSIFIED_COLLECTION: &str = "Unclassified";
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -305,9 +311,33 @@ pub async fn list_zotero_unclassified(
         .unwrap_or_else(|| DEFAULT_UNCLASSIFIED_COLLECTION.to_string());
 
     let raw = crate::zotero::list_collection_pdf_items(collection_name).await?;
+    Ok(dedup_zotero_entries(raw, &content_root))
+}
 
+/// List every top-level item across the entire Zotero library that has not
+/// yet been imported into the wiki.
+///
+/// Distinct from [`list_zotero_unclassified`] in that no collection filter is
+/// applied — this is the "import everything I had before LLM-Wiki" button on
+/// the dashboard.  Already-imported items (by slug) are filtered out so it is
+/// safe to invoke repeatedly.
+#[tauri::command]
+pub async fn list_zotero_all(
+    content_root: String,
+) -> Result<Vec<ZoteroPdfImportEntry>, String> {
+    let raw = crate::zotero::list_all_pdf_items().await?;
+    Ok(dedup_zotero_entries(raw, &content_root))
+}
+
+/// Convert raw Zotero entries into import candidates, filtering out any whose
+/// slug already exists under `content_root/papers/`.  Sorted by title for the
+/// UI.  Shared by `list_zotero_unclassified` and `list_zotero_all`.
+fn dedup_zotero_entries(
+    raw: Vec<crate::zotero::ZoteroPdfEntry>,
+    content_root: &str,
+) -> Vec<ZoteroPdfImportEntry> {
     let existing = collect_existing_markdown_stems(
-        &PathBuf::from(&content_root).join("papers"),
+        &PathBuf::from(content_root).join("papers"),
     );
 
     let mut out: Vec<ZoteroPdfImportEntry> = raw
@@ -341,7 +371,7 @@ pub async fn list_zotero_unclassified(
         .collect();
 
     out.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
-    Ok(out)
+    out
 }
 
 /// Import a single Zotero item: download its PDF attachment, convert to

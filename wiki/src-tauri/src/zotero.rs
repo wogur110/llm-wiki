@@ -13,6 +13,7 @@
 //! | `update_collection`              | `Result<(), String>`               | Move item to a named collection                      |
 //! | `wait_for_zotmoov`               | `Result<(), String>`               | Block until PDF appears at expected path             |
 //! | `list_collection_pdf_items`      | `Result<Vec<ZoteroPdfEntry>, ..>`  | Items + PDF attachment in a named collection         |
+//! | `list_all_pdf_items`             | `Result<Vec<ZoteroPdfEntry>, ..>`  | Items + PDF attachment across the entire library     |
 //! | `download_attachment`            | `Result<Vec<u8>, String>`          | Raw file bytes for a Zotero attachment (PDF, etc.)   |
 
 use reqwest::Client;
@@ -534,6 +535,42 @@ pub async fn list_collection_pdf_items(
         .await
         .map_err(|e| format!("JSON decode error: {e}"))?;
 
+    Ok(resolve_pdf_entries(&client, top_items).await)
+}
+
+/// List every top-level item in the **entire** user library together with its
+/// first PDF attachment.  Used by the "import existing Zotero" flow that
+/// re-imports a library that pre-dates LLM-Wiki — no collection filter.
+///
+/// Items without a PDF child are silently skipped.
+#[tauri::command]
+pub async fn list_all_pdf_items() -> Result<Vec<ZoteroPdfEntry>, String> {
+    let client = build_client();
+
+    let top_items: Vec<serde_json::Value> = client
+        .get(format!("{ZOTERO_API}/items/top"))
+        // `limit=100` is the Zotero per-request maximum; if the library is
+        // larger we will need pagination, but 100 covers most personal
+        // libraries and keeps the first-render latency bounded.
+        .query(&[("limit", "100")])
+        .send()
+        .await
+        .map_err(|e| format!("Zotero unreachable: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("Zotero API error: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("JSON decode error: {e}"))?;
+
+    Ok(resolve_pdf_entries(&client, top_items).await)
+}
+
+/// Resolve a list of top-level item JSON blobs into [`ZoteroPdfEntry`] values.
+/// Items whose first attachment is not a PDF are dropped.  Sorted by title.
+async fn resolve_pdf_entries(
+    client: &Client,
+    top_items: Vec<serde_json::Value>,
+) -> Vec<ZoteroPdfEntry> {
     let mut out: Vec<ZoteroPdfEntry> = Vec::with_capacity(top_items.len());
 
     for item in top_items {
@@ -545,7 +582,7 @@ pub async fn list_collection_pdf_items(
             .map(str::to_string)
             .unwrap_or_else(|| item_key.clone());
 
-        if let Ok(Some(pdf)) = first_pdf_attachment(&client, &item_key).await {
+        if let Ok(Some(pdf)) = first_pdf_attachment(client, &item_key).await {
             out.push(ZoteroPdfEntry {
                 item_key,
                 attachment_key: pdf.0,
@@ -555,9 +592,8 @@ pub async fn list_collection_pdf_items(
         }
     }
 
-    // Stable ordering for the UI.
     out.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
-    Ok(out)
+    out
 }
 
 /// Return `(attachment_key, filename)` for the item's first PDF attachment,

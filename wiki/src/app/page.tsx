@@ -31,12 +31,14 @@ type OrganizeState =
   | { kind: 'running'; done: number; total: number; current: string }
   | { kind: 'finished'; success: number; failed: number; total: number }
 
+type ImportSource = 'unclassified' | 'library'
+
 type ImportState =
   | { kind: 'idle' }
-  | { kind: 'scanning' }
-  | { kind: 'running'; done: number; total: number; current: string }
-  | { kind: 'finished'; success: number; failed: number; total: number }
-  | { kind: 'error'; message: string }
+  | { kind: 'scanning'; source: ImportSource }
+  | { kind: 'running';  source: ImportSource; done: number; total: number; current: string }
+  | { kind: 'finished'; source: ImportSource; success: number; failed: number; total: number }
+  | { kind: 'error';    source: ImportSource; message: string }
 
 interface ZoteroPdfImportEntry {
   item_key: string
@@ -131,33 +133,48 @@ export default function DashboardPage() {
     await refresh()
   }
 
-  const handleImportPdfs = async () => {
+  /**
+   * Drive the Zotero-driven PDF import flow.
+   *
+   * `source = 'unclassified'`  → only the `Unclassified` collection
+   * `source = 'library'`       → every top-level item in the Zotero library
+   *
+   * Already-imported papers (by slug) are filtered out backend-side, so this
+   * can be called repeatedly without producing duplicates.
+   */
+  const runImport = async (source: ImportSource) => {
     if (importState.kind === 'running' || importState.kind === 'scanning') return
 
     const contentRoot = window.localStorage.getItem('content-root') ?? ''
     if (!contentRoot) {
       setImportState({
         kind: 'error',
+        source,
         message: '위키 폴더가 초기화되지 않았습니다. 앱을 재시작해 주세요.',
       })
       return
     }
 
-    setImportState({ kind: 'scanning' })
+    setImportState({ kind: 'scanning', source })
 
     let items: ZoteroPdfImportEntry[]
     try {
-      items = await invoke<ZoteroPdfImportEntry[]>(
-        'list_zotero_unclassified',
-        { collection: null, contentRoot },
-      )
+      items = source === 'unclassified'
+        ? await invoke<ZoteroPdfImportEntry[]>(
+            'list_zotero_unclassified',
+            { collection: null, contentRoot },
+          )
+        : await invoke<ZoteroPdfImportEntry[]>(
+            'list_zotero_all',
+            { contentRoot },
+          )
     } catch (e) {
-      setImportState({ kind: 'error', message: String(e) })
+      setImportState({ kind: 'error', source, message: String(e) })
       return
     }
 
     if (items.length === 0) {
-      setImportState({ kind: 'finished', success: 0, failed: 0, total: 0 })
+      setImportState({ kind: 'finished', source, success: 0, failed: 0, total: 0 })
       return
     }
 
@@ -167,6 +184,7 @@ export default function DashboardPage() {
       const item = items[i]
       setImportState({
         kind: 'running',
+        source,
         done: i,
         total: items.length,
         current: item.title,
@@ -183,9 +201,12 @@ export default function DashboardPage() {
       }
     }
 
-    setImportState({ kind: 'finished', success, failed, total: items.length })
+    setImportState({ kind: 'finished', source, success, failed, total: items.length })
     await refresh()
   }
+
+  const handleImportPdfs    = () => runImport('unclassified')
+  const handleImportLibrary = () => runImport('library')
 
   return (
     <div className="mx-auto max-w-6xl px-6 py-8 space-y-10">
@@ -209,7 +230,21 @@ export default function DashboardPage() {
           >
             새로고침
           </button>
-          <ImportPdfsButton state={importState} onClick={handleImportPdfs} />
+          <ImportPdfsButton
+            source="unclassified"
+            state={importState}
+            onClick={handleImportPdfs}
+            idleLabel="PDF 가져오기"
+            tooltip="Zotero의 Unclassified 컬렉션에서 새 PDF만 가져옵니다"
+          />
+          <ImportPdfsButton
+            source="library"
+            state={importState}
+            onClick={handleImportLibrary}
+            idleLabel="기존 Zotero 불러오기"
+            tooltip="Zotero 라이브러리 전체 PDF를 한 번에 불러옵니다"
+            variant="secondary"
+          />
           <OrganizeNowButton
             pendingCount={pending.length}
             state={organize}
@@ -220,7 +255,7 @@ export default function DashboardPage() {
 
       {importState.kind === 'error' && (
         <div className="rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-950/40 px-4 py-3 text-sm text-red-700 dark:text-red-300">
-          PDF 가져오기 실패: {importState.message}
+          {importState.source === 'library' ? '기존 Zotero 불러오기' : 'PDF 가져오기'} 실패: {importState.message}
         </div>
       )}
 
@@ -402,14 +437,34 @@ function OrganizeNowButton({
   )
 }
 
+/**
+ * Trigger one of the Zotero import flows.  Two of these live side-by-side on
+ * the dashboard and share a single `importState`; the `source` prop tells the
+ * component which flow it represents so only the active button shows progress
+ * while the other stays disabled and idle-styled.
+ */
 function ImportPdfsButton({
+  source,
   state,
   onClick,
+  idleLabel,
+  tooltip,
+  variant = 'primary',
 }: {
+  source: ImportSource
   state: ImportState
   onClick: () => void
+  idleLabel: string
+  tooltip?: string
+  variant?: 'primary' | 'secondary'
 }) {
-  if (state.kind === 'scanning') {
+  const isActive  = state.kind !== 'idle' && 'source' in state && state.source === source
+  const otherBusy =
+    !isActive &&
+    (state.kind === 'scanning' || state.kind === 'running')
+
+  // Active flow → show the in-flight progress chip.
+  if (isActive && state.kind === 'scanning') {
     return (
       <div className="flex items-center gap-2 rounded-lg bg-violet-600 px-3 py-1.5 text-xs font-medium text-white">
         <span className="inline-block h-3 w-3 rounded-full border-2 border-white border-t-transparent animate-spin" />
@@ -418,7 +473,7 @@ function ImportPdfsButton({
     )
   }
 
-  if (state.kind === 'running') {
+  if (isActive && state.kind === 'running') {
     return (
       <div className="flex items-center gap-2 rounded-lg bg-violet-600 px-3 py-1.5 text-xs font-medium text-white">
         <span className="inline-block h-3 w-3 rounded-full border-2 border-white border-t-transparent animate-spin" />
@@ -429,7 +484,7 @@ function ImportPdfsButton({
     )
   }
 
-  if (state.kind === 'finished') {
+  if (isActive && state.kind === 'finished') {
     const ok = state.failed === 0
     const label =
       state.total === 0
@@ -439,6 +494,7 @@ function ImportPdfsButton({
       <button
         type="button"
         onClick={onClick}
+        title={tooltip}
         className={`rounded-lg px-3 py-1.5 text-xs font-medium text-white transition-colors ${
           ok ? 'bg-green-600 hover:bg-green-700' : 'bg-amber-600 hover:bg-amber-700'
         }`}
@@ -448,13 +504,22 @@ function ImportPdfsButton({
     )
   }
 
+  // Idle styling — secondary variant is the same hue but lighter / outlined so
+  // the two buttons read as related but distinct in the header.
+  const idleClass =
+    variant === 'primary'
+      ? 'bg-violet-600 text-white hover:bg-violet-700'
+      : 'border border-violet-300 dark:border-violet-700 bg-white dark:bg-zinc-900 text-violet-700 dark:text-violet-300 hover:bg-violet-50 dark:hover:bg-violet-950/30'
+
   return (
     <button
       type="button"
       onClick={onClick}
-      className="rounded-lg bg-violet-600 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-violet-700"
+      disabled={otherBusy}
+      title={tooltip}
+      className={`rounded-lg px-3 py-1.5 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${idleClass}`}
     >
-      PDF 가져오기
+      {idleLabel}
     </button>
   )
 }
