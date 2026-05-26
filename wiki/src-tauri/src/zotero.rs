@@ -78,6 +78,30 @@ pub struct ZoteroItemData {
     /// DOI string, e.g. `"10.1145/3442188.3445922"`.
     #[serde(rename = "DOI")]
     pub doi: Option<String>,
+    /// Authors / editors / contributors as returned by Zotero.
+    #[serde(default)]
+    pub creators: Vec<ZoteroCreator>,
+    /// Free-form date string ("2017", "2017-06-12", "June 2017", …).
+    pub date: Option<String>,
+    /// `url` field — used as a last-resort link when no DOI exists.
+    pub url: Option<String>,
+}
+
+/// One creator/author entry returned by the Zotero API.
+///
+/// Zotero stores either `firstName + lastName` (people) or `name`
+/// (institutions, single-field aliases like "OpenAI") — both shapes are
+/// allowed in the same `creators` array.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ZoteroCreator {
+    #[serde(rename = "creatorType")]
+    pub creator_type: Option<String>,
+    #[serde(rename = "firstName")]
+    pub first_name: Option<String>,
+    #[serde(rename = "lastName")]
+    pub last_name: Option<String>,
+    /// Single-field name (institutions, group authors).
+    pub name: Option<String>,
 }
 
 /// A top-level Zotero item paired with its first PDF attachment, ready to be

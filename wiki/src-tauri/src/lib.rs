@@ -1,3 +1,4 @@
+pub mod abstract_lookup;
 pub mod content;
 pub mod gemini;
 pub mod keychain;

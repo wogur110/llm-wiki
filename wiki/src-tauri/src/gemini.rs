@@ -163,23 +163,100 @@ fn normalise_category(raw: &str) -> String {
         .join("-")
 }
 
-/// User-facing HTTP error text — never include the request URL (it embeds the API key).
-fn format_gemini_http_error(status: reqwest::StatusCode) -> String {
+/// Raw PDF size we can send as `inline_data`.  The whole JSON request must stay
+/// under ~20 MB; base64 inflates bytes by ~4/3, plus the prompt text.
+const MAX_INLINE_PDF_BYTES: usize = 12 * 1024 * 1024;
+
+/// Hard ceiling for PDF processing on Gemini (inline or Files API).
+const MAX_PDF_BYTES: usize = 50 * 1024 * 1024;
+
+#[derive(Debug, Deserialize)]
+struct GeminiApiErrorEnvelope {
+    error: Option<GeminiApiErrorDetail>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiApiErrorDetail {
+    message: Option<String>,
+}
+
+/// True when `bytes` begin with the PDF magic header.
+pub(crate) fn looks_like_pdf(bytes: &[u8]) -> bool {
+    bytes.len() >= 5 && bytes.starts_with(b"%PDF-")
+}
+
+/// Build a user-facing message from an HTTP status and optional Gemini JSON body.
+/// Never includes the request URL (it may embed the API key).
+fn format_gemini_http_error(status: reqwest::StatusCode, api_message: Option<&str>) -> String {
+    let detail = api_message.unwrap_or("").to_lowercase();
+
     match status.as_u16() {
+        400 => {
+            if detail.contains("too large")
+                || detail.contains("bytes are too large")
+                || detail.contains("payload size")
+                || detail.contains("exceeds")
+            {
+                return "PDF가 너무 커서 Gemini가 거부했습니다(400). \
+                        인라인 전송 한도는 약 12 MB, 처리 한도는 50 MB입니다. \
+                        Adobe 등으로 PDF를 압축하거나 페이지를 나눈 뒤 다시 시도하세요."
+                    .into();
+            }
+            if detail.contains("too many pages") || detail.contains("page") {
+                return "PDF 페이지 수가 Gemini 한도(약 1,000쪽)를 넘었습니다(400). \
+                        파일을 나눠서 다시 시도하세요."
+                    .into();
+            }
+            if detail.contains("mime") || detail.contains("invalid argument") {
+                let extra = api_message
+                    .filter(|m| !m.is_empty())
+                    .map(|m| format!(" (서버: {m})"))
+                    .unwrap_or_default();
+                return format!(
+                    "Gemini가 PDF를 읽지 못했습니다(400). \
+                     암호가 걸린 PDF, 손상된 파일, 또는 Zotero에서 PDF가 아닌 데이터가 \
+                     내려받힌 경우일 수 있습니다.{extra}"
+                );
+            }
+            format!(
+                "Gemini 요청이 거부되었습니다(400).{}",
+                api_message
+                    .filter(|m| !m.is_empty())
+                    .map(|m| format!(" 서버 메시지: {m}"))
+                    .unwrap_or_else(|| {
+                        " PDF가 암호화·손상되었거나 너무 클 수 있습니다.".into()
+                    })
+            )
+        }
         401 | 403 => {
             "Gemini API 키가 거부되었습니다. AI Studio에서 키를 다시 발급받았는지 확인하세요.".into()
         }
         429 => {
-            // 429는 무료 / Tier 1 / Tier 2 어떤 티어에서도 RPM·TPM·RPD 한도 초과 시 발생.
-            // 사용자의 티어를 단정하지 않고 한도 확인 경로만 안내한다.
             "Gemini API 한도 초과(429). RPM·TPM·RPD 중 하나가 막혔습니다. \
              현재 프로젝트의 한도는 AI Studio → Rate limits 메뉴에서 확인하고, \
              무료 티어라면 AI Studio → Billing에서 결제 카드를 연결하면 \
              gemini-2.5-pro 한도가 5 RPM → 150 RPM로 자동 상승합니다."
                 .into()
         }
-        n => format!("Gemini API 오류: HTTP {n}"),
+        n => {
+            if let Some(m) = api_message.filter(|s| !s.is_empty()) {
+                format!("Gemini API 오류: HTTP {n} — {m}")
+            } else {
+                format!("Gemini API 오류: HTTP {n}")
+            }
+        }
     }
+}
+
+/// Read the JSON error body from a failed Gemini response.
+async fn gemini_error_from_response(resp: reqwest::Response) -> String {
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    let api_message = serde_json::from_str::<GeminiApiErrorEnvelope>(&text)
+        .ok()
+        .and_then(|e| e.error)
+        .and_then(|d| d.message);
+    format_gemini_http_error(status, api_message.as_deref())
 }
 
 // ── Tauri commands ─────────────────────────────────────────────────────────
@@ -224,9 +301,8 @@ pub async fn test_connection(api_key: Option<String>) -> Result<bool, String> {
         .await
         .map_err(|e| format!("Network error: {e}"))?;
 
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(format_gemini_http_error(status));
+    if !resp.status().is_success() {
+        return Err(gemini_error_from_response(resp).await);
     }
 
     Ok(true)
@@ -495,8 +571,9 @@ pub async fn classify_paper(
 /// Convert a PDF file (read into memory) into a markdown document.
 ///
 /// Sends the raw PDF inline (base64) to Gemini along with a prompt that asks
-/// for a structured markdown export with YAML frontmatter.  Suitable for
-/// research papers up to ~20 MB — the Gemini inline limit.
+/// for a structured markdown export with YAML frontmatter.  Raw PDFs must be
+/// ≤ [`MAX_INLINE_PDF_BYTES`] (~12 MB) because the entire HTTP request body
+/// (base64 + prompt) must stay under Gemini's ~20 MB inline ceiling.
 ///
 /// The returned string is expected to start with a YAML frontmatter block
 /// containing at least `title:` and `abstract:` so the existing organiser
@@ -504,13 +581,34 @@ pub async fn classify_paper(
 ///
 /// # Errors
 /// * Missing API key
-/// * Network / HTTP error (401, 429, 5xx)
+/// * Invalid / empty / oversized PDF
+/// * Network / HTTP error (400, 401, 429, 5xx) with Gemini message when available
 /// * Empty response from Gemini
 pub async fn extract_pdf_to_markdown(pdf_bytes: Vec<u8>) -> Result<String, String> {
-    const MAX_INLINE_BYTES: usize = 20 * 1024 * 1024;
-    if pdf_bytes.len() > MAX_INLINE_BYTES {
+    if pdf_bytes.is_empty() {
+        return Err(
+            "Zotero에서 받은 PDF가 비어 있습니다. Zotero에서 해당 항목의 첨부 파일이 \
+             정상인지 확인하세요."
+                .into(),
+        );
+    }
+    if !looks_like_pdf(&pdf_bytes) {
+        return Err(
+            "다운로드한 파일이 PDF가 아닙니다(%PDF- 헤더 없음). Zotero에서 PDF 첨부가 \
+             연결·동기화되었는지, 또는 HTML/오류 페이지가 아닌지 확인하세요."
+                .into(),
+        );
+    }
+    if pdf_bytes.len() > MAX_PDF_BYTES {
         return Err(format!(
-            "PDF is {} MB — Gemini inline limit is 20 MB. Split the file or use the File API.",
+            "PDF가 {} MB입니다. Gemini 처리 한도는 50 MB입니다. 파일을 압축하거나 나눠 주세요.",
+            pdf_bytes.len() / (1024 * 1024)
+        ));
+    }
+    if pdf_bytes.len() > MAX_INLINE_PDF_BYTES {
+        return Err(format!(
+            "PDF가 {} MB입니다. 앱의 인라인 전송 한도는 약 12 MB입니다 \
+             (Gemini 요청 본문 20 MB 제한). Adobe 등으로 압축한 뒤 다시 시도하세요.",
             pdf_bytes.len() / (1024 * 1024)
         ));
     }
@@ -549,9 +647,8 @@ Rules:\n\
         .await
         .map_err(|e| format!("Network error: {e}"))?;
 
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(format_gemini_http_error(status));
+    if !resp.status().is_success() {
+        return Err(gemini_error_from_response(resp).await);
     }
 
     let parsed: GeminiResponse = resp

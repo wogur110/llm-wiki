@@ -2,20 +2,23 @@
 //!
 //! There are two entry points into this module:
 //!
-//! 1. **Zotero-driven (preferred)** — the importer asks Zotero for every item
-//!    in the `unclassified` collection, downloads each PDF attachment through
-//!    the local API, runs it through Gemini, and writes the resulting
-//!    markdown to `content/papers/unclassified/`.  No filesystem path needs
-//!    to be configured because Zotero is the single source of truth.
+//! 1. **Zotero-driven (preferred)** — the importer asks Zotero for every
+//!    top-level item (or every item in the `Unclassified` collection) and
+//!    builds a markdown stub from Zotero's own metadata.  When Zotero is
+//!    missing the abstract, [`crate::abstract_lookup`] fetches one from
+//!    Crossref / Semantic Scholar / OpenAlex.  **The PDF is never sent to
+//!    Gemini** — we only need title + abstract for classification, and
+//!    everything else already lives in Zotero.
 //!
 //!    ```text
-//!     Zotero "unclassified" collection
-//!            │  GET /items/<key>/file
-//!            ▼
-//!     PDF bytes ──► gemini::extract_pdf_to_markdown
+//!     Zotero item (key + DOI + metadata)
 //!            │
-//!            ▼
-//!     content/papers/unclassified/<slug>.md   (with zotero_key in frontmatter)
+//!            ├──► Zotero.abstractNote ──┐
+//!            │                          ▼
+//!            └──► Crossref / S2 / OpenAlex  (only if Zotero abstract empty)
+//!                                       │
+//!                                       ▼
+//!     content/papers/unclassified/<slug>.md   (frontmatter-only stub)
 //!            │
 //!            ▼  organizer::process_paper_core
 //!     content/papers/<category>/<slug>.md
@@ -23,7 +26,9 @@
 //!
 //! 2. **Legacy filesystem-driven** — kept so users without Zotero can still
 //!    feed a folder of PDFs into the wiki.  See `list_unprocessed_pdfs` /
-//!    `import_pdf` below.
+//!    `import_pdf` below.  This path *does* call
+//!    [`crate::gemini::extract_pdf_to_markdown`] because no Zotero metadata
+//!    is available.
 //!
 //! # Tauri commands exposed
 //! | Command                          | Returns                          | Description                                          |
@@ -276,31 +281,6 @@ pub struct ZoteroPdfImportEntry {
     pub collection_name: Option<String>,
 }
 
-/// Inject `zotero_key: <key>` into the YAML frontmatter so the organiser can
-/// look the item up directly in step 4.  If Gemini's output has no
-/// frontmatter the function returns the original string unchanged — the
-/// organiser tolerates that case but it is unlikely in practice.
-fn inject_zotero_key(markdown: &str, item_key: &str) -> String {
-    if !markdown.starts_with("---\n") {
-        return markdown.to_string();
-    }
-    let after_open = &markdown[4..];
-    let Some(close_pos) = after_open.find("\n---") else {
-        return markdown.to_string();
-    };
-    let fm = &after_open[..close_pos];
-    let rest = &after_open[close_pos..]; // starts with "\n---"
-
-    // Strip any pre-existing zotero_key line to keep injection idempotent.
-    let cleaned: Vec<&str> = fm
-        .lines()
-        .filter(|l| !l.trim_start().starts_with("zotero_key:"))
-        .collect();
-    let cleaned_fm = cleaned.join("\n");
-
-    format!("---\n{cleaned_fm}\nzotero_key: {item_key}{rest}")
-}
-
 /// List every item in the named Zotero collection that has not yet been
 /// imported into the wiki.
 ///
@@ -394,26 +374,137 @@ fn dedup_zotero_entries(
     out
 }
 
-/// Import a single Zotero item: download its PDF attachment, convert to
-/// markdown with Gemini, write to `content/papers/unclassified/<slug>.md` with
-/// `zotero_key` injected into the frontmatter, then run the organiser
-/// pipeline.
+/// All metadata required to build a frontmatter-only markdown stub.
+struct PaperMeta<'a> {
+    title: &'a str,
+    abstract_text: &'a str,
+    doi: Option<&'a str>,
+    year: Option<&'a str>,
+    authors: Option<&'a str>,
+    zotero_key: &'a str,
+}
+
+/// Render a YAML-frontmatter stub.  The body is intentionally empty — the
+/// organiser uses `title + abstract` for classification and the wiki shows
+/// the abstract as the paper page itself.
+fn build_metadata_markdown(m: PaperMeta<'_>) -> String {
+    let title = escape_yaml_plain(m.title);
+    let abstract_text = escape_yaml_plain(m.abstract_text);
+    let authors = m.authors.map(escape_yaml_plain).unwrap_or_default();
+    let doi = m.doi.unwrap_or("").trim();
+    let year = m.year.unwrap_or("").trim();
+
+    format!(
+        "---\n\
+         title: \"{title}\"\n\
+         authors: \"{authors}\"\n\
+         abstract: \"{abstract_text}\"\n\
+         doi: \"{doi}\"\n\
+         year: {year}\n\
+         zotero_key: {zk}\n\
+         ---\n\n\
+         {body}\n",
+        zk = m.zotero_key,
+        body = if abstract_text.is_empty() {
+            String::new()
+        } else {
+            format!("## Abstract\n\n{abstract_text}")
+        },
+    )
+}
+
+/// Make a string safe inside a YAML double-quoted scalar that
+/// `organizer::parse_frontmatter` reads as a single line.
+///
+/// We use a plain (single-line) representation: newlines become spaces,
+/// embedded double quotes are mapped to U+201C/U+201D curly quotes so the
+/// naive `trim_matches('"')` in the existing parser does not get confused.
+pub(crate) fn escape_yaml_plain(s: &str) -> String {
+    let collapsed = s.replace('\r', " ").replace('\n', " ");
+    let trimmed: String = collapsed.split_whitespace().collect::<Vec<_>>().join(" ");
+    trimmed.replace('"', "\u{201D}")
+}
+
+/// Build a single-line `"First Last, First Last"` author list.
+///
+/// Skips editors/translators (the wiki only cares about authors) and falls
+/// back to the institutional `name` field when no first/last name is set.
+pub(crate) fn format_authors(creators: &[crate::zotero::ZoteroCreator]) -> Option<String> {
+    let names: Vec<String> = creators
+        .iter()
+        .filter(|c| {
+            c.creator_type
+                .as_deref()
+                .map(|t| t.eq_ignore_ascii_case("author"))
+                .unwrap_or(true)
+        })
+        .filter_map(|c| match (c.first_name.as_deref(), c.last_name.as_deref(), c.name.as_deref()) {
+            (Some(f), Some(l), _) if !f.is_empty() && !l.is_empty() => {
+                Some(format!("{f} {l}"))
+            }
+            (None, Some(l), _) if !l.is_empty() => Some(l.to_string()),
+            (Some(f), None, _) if !f.is_empty() => Some(f.to_string()),
+            (_, _, Some(n)) if !n.trim().is_empty() => Some(n.trim().to_string()),
+            _ => None,
+        })
+        .collect();
+    if names.is_empty() {
+        None
+    } else {
+        Some(names.join(", "))
+    }
+}
+
+/// Extract a 4-digit year from any Zotero date string.
+///
+/// Handles `"2017"`, `"2017-06-12"`, `"2017-06"`, `"June 2017"` and similar.
+/// Returns `None` if no plausible year (1800-2099) appears.
+pub(crate) fn extract_year(date: Option<&str>) -> Option<String> {
+    let d = date?.trim();
+    let bytes = d.as_bytes();
+    if bytes.len() < 4 {
+        return None;
+    }
+    for i in 0..=bytes.len() - 4 {
+        let slice = &bytes[i..i + 4];
+        if !slice.iter().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let n: u32 = std::str::from_utf8(slice).ok()?.parse().ok()?;
+        if (1800..=2099).contains(&n) {
+            return Some(n.to_string());
+        }
+    }
+    None
+}
+
+/// Import a single Zotero item into the wiki using **metadata only**.
+///
+/// The original PDF is never downloaded or sent to Gemini.  All required
+/// fields (title, authors, DOI, year, abstract) come straight from Zotero;
+/// when Zotero's `abstractNote` is empty, [`crate::abstract_lookup`] fetches
+/// the abstract from public scholarly APIs (Crossref → Semantic Scholar →
+/// OpenAlex) using the DOI, or by title as a last resort.
+///
+/// `attachment_key` is no longer used for the import itself, but is kept in
+/// the signature for backward compatibility with the JS frontend (the
+/// listing endpoints still return it, and a future "open original PDF in
+/// Zotero" button can consume it without another round-trip).
 ///
 /// Because the importer already knows the Zotero item key, step 4 of the
 /// pipeline (collection update) uses it directly — no DOI guesswork.  The
-/// organiser is run with [`PdfMoveSpec::None`] because ZotMoov receives the
-/// authoritative signal via Zotero's collection field; LLM-Wiki does not need
-/// to verify the physical move.
+/// organiser is run with [`crate::organizer::PdfMoveSpec::None`] because
+/// ZotMoov receives the authoritative signal via Zotero's collection field;
+/// LLM-Wiki does not need to verify the physical move.
 ///
 /// # Category resolution
 /// * `override_category = Some(cat)` — used by the "import existing library"
 ///   flow where the paper's Zotero collection is already known.  The Gemini
 ///   classification call is skipped entirely and `cat` is used directly.
 /// * `override_category = None` — used by the "import unclassified" flow.
-///   `process_paper_core` calls Gemini for classification after the markdown
-///   file is written to disk.  This keeps the total number of Gemini calls at
-///   two per item (PDF → markdown + classify) and avoids the 429 rate-limit
-///   that a third back-to-back call would trigger on the free tier.
+///   `process_paper_core` calls Gemini for classification using only
+///   `title + abstract` (no PDF, no body).  This is **one** Gemini call per
+///   item instead of two, drastically reducing 429 / 400 errors.
 #[tauri::command]
 pub async fn import_zotero_item_and_organize(
     item_key: String,
@@ -422,19 +513,59 @@ pub async fn import_zotero_item_and_organize(
     override_category: Option<String>,
     window: tauri::WebviewWindow,
 ) -> Result<crate::organizer::ProcessResult, String> {
-    // ── Download the PDF bytes through the local API ──────────────────────
-    let pdf_bytes = crate::zotero::download_attachment(attachment_key.clone()).await?;
+    // `attachment_key` is currently unused — the metadata-only flow does not
+    // download the PDF.  We keep the parameter so the JS bindings continue
+    // to compile and a future "open PDF" UI can pass it through.
+    let _ = attachment_key;
 
-    // ── Gemini PDF → markdown ─────────────────────────────────────────────
-    let markdown_raw = crate::gemini::extract_pdf_to_markdown(pdf_bytes).await?;
-    let markdown = inject_zotero_key(&markdown_raw, &item_key);
-
-    // ── Fetch metadata once so we can build a stable slug ─────────────────
+    // ── Fetch Zotero metadata ─────────────────────────────────────────────
     let item = crate::zotero::get_item_by_key(item_key.clone())
         .await
         .map_err(|e| format!("Zotero item lookup failed: {e}"))?;
 
-    let title = item.data.title.clone().unwrap_or_else(|| item_key.clone());
+    let title = item
+        .data
+        .title
+        .clone()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| item_key.clone());
+
+    let doi = item
+        .data
+        .doi
+        .clone()
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty());
+
+    let authors = format_authors(&item.data.creators);
+    let year = extract_year(item.data.date.as_deref());
+
+    // ── Resolve abstract: Zotero > Crossref/S2/OpenAlex > title search ────
+    let zotero_abstract = item
+        .data
+        .abstract_note
+        .clone()
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty());
+
+    let abstract_text = match zotero_abstract {
+        Some(a) => a,
+        None => {
+            let from_doi = match doi.as_deref() {
+                Some(d) => crate::abstract_lookup::fetch_abstract_by_doi(d).await,
+                None => None,
+            };
+            match from_doi {
+                Some(a) => a,
+                None => crate::abstract_lookup::fetch_abstract_by_title(&title)
+                    .await
+                    .unwrap_or_default(),
+            }
+        }
+    };
+
+    // ── Build the markdown stub ───────────────────────────────────────────
     let slug = slugify(&title);
     let slug = if slug.is_empty() {
         slugify(&item_key)
@@ -442,17 +573,14 @@ pub async fn import_zotero_item_and_organize(
         slug
     };
 
-    // ── Determine category override ───────────────────────────────────────
-    //
-    // For library imports the Zotero collection name is already known — pass
-    // it directly so `process_paper_core` skips the Gemini classification call.
-    //
-    // For unclassified items pass `None` and let `process_paper_core` call
-    // Gemini internally (after the file is written to disk).  This keeps the
-    // total Gemini call count at two per item — one for PDF→markdown and one
-    // for classification — avoiding 429 rate-limit errors from a back-to-back
-    // third call that the previous implementation introduced.
-    let gemini_override: Option<Result<String, String>> = override_category.map(Ok);
+    let markdown = build_metadata_markdown(PaperMeta {
+        title: &title,
+        abstract_text: &abstract_text,
+        doi: doi.as_deref(),
+        year: year.as_deref(),
+        authors: authors.as_deref(),
+        zotero_key: &item_key,
+    });
 
     // ── Write to unclassified/<slug>.md ───────────────────────────────────
     let unclassified_dir = PathBuf::from(&content_root)
@@ -467,8 +595,8 @@ pub async fn import_zotero_item_and_organize(
         .map_err(|e| format!("Cannot write markdown file: {e}"))?;
 
     // ── Hand off to the organiser pipeline ────────────────────────────────
-    // pdf_root / pdf_filename are intentionally None — ZotMoov is driven by
-    // the Zotero collection change (step 4) and we trust it to move the file.
+    let gemini_override: Option<Result<String, String>> = override_category.map(Ok);
+
     let window_clone = window.clone();
     let emit_fn = move |step: &str, status: &str, detail: Option<&str>| {
         let _ = window_clone.emit(
@@ -561,28 +689,90 @@ mod tests {
     }
 
     #[test]
-    fn inject_zotero_key_adds_field_to_frontmatter() {
-        let md = "---\ntitle: T\nabstract: A.\n---\n\nbody";
-        let out = inject_zotero_key(md, "ABCD1234");
-        assert!(out.contains("zotero_key: ABCD1234"));
-        assert!(out.contains("title: T"));
-        assert!(out.ends_with("body"));
+    fn build_metadata_markdown_includes_required_fields() {
+        let md = build_metadata_markdown(PaperMeta {
+            title: "Attention Is All You Need",
+            abstract_text: "We propose a new architecture.",
+            doi: Some("10.1234/test"),
+            year: Some("2017"),
+            authors: Some("Ashish Vaswani, Noam Shazeer"),
+            zotero_key: "ABCD1234",
+        });
+        assert!(md.starts_with("---\n"));
+        assert!(md.contains("title: \"Attention Is All You Need\""));
+        assert!(md.contains("authors: \"Ashish Vaswani, Noam Shazeer\""));
+        assert!(md.contains("abstract: \"We propose a new architecture.\""));
+        assert!(md.contains("doi: \"10.1234/test\""));
+        assert!(md.contains("year: 2017"));
+        assert!(md.contains("zotero_key: ABCD1234"));
+        assert!(md.contains("## Abstract"));
     }
 
     #[test]
-    fn inject_zotero_key_is_idempotent() {
-        let md = "---\ntitle: T\nzotero_key: STALE\nabstract: A.\n---\n\nbody";
-        let out = inject_zotero_key(md, "FRESH");
-        let count = out.matches("zotero_key:").count();
-        assert_eq!(count, 1, "expected exactly one zotero_key entry: {out}");
-        assert!(out.contains("zotero_key: FRESH"));
-        assert!(!out.contains("STALE"));
+    fn build_metadata_markdown_handles_missing_abstract() {
+        let md = build_metadata_markdown(PaperMeta {
+            title: "T",
+            abstract_text: "",
+            doi: None,
+            year: None,
+            authors: None,
+            zotero_key: "K",
+        });
+        assert!(md.contains("abstract: \"\""));
+        assert!(md.contains("year: "));
+        assert!(!md.contains("## Abstract"));
     }
 
     #[test]
-    fn inject_zotero_key_no_frontmatter_returns_unchanged() {
-        let md = "no frontmatter here";
-        let out = inject_zotero_key(md, "ABC");
-        assert_eq!(out, md);
+    fn escape_yaml_plain_strips_newlines_and_quotes() {
+        let raw = "Line\nwith\r\nbreaks and \"quotes\"";
+        let out = escape_yaml_plain(raw);
+        assert!(!out.contains('\n'));
+        assert!(!out.contains('\r'));
+        assert!(!out.contains('"'));
+        assert!(out.contains("Line with breaks"));
+    }
+
+    #[test]
+    fn format_authors_combines_first_and_last_names() {
+        use crate::zotero::ZoteroCreator;
+        let creators = vec![
+            ZoteroCreator {
+                creator_type: Some("author".into()),
+                first_name: Some("Ashish".into()),
+                last_name: Some("Vaswani".into()),
+                name: None,
+            },
+            ZoteroCreator {
+                creator_type: Some("editor".into()),
+                first_name: Some("Anon".into()),
+                last_name: Some("Editor".into()),
+                name: None,
+            },
+            ZoteroCreator {
+                creator_type: Some("author".into()),
+                first_name: None,
+                last_name: None,
+                name: Some("OpenAI".into()),
+            },
+        ];
+        let out = format_authors(&creators).unwrap();
+        assert_eq!(out, "Ashish Vaswani, OpenAI");
+    }
+
+    #[test]
+    fn format_authors_returns_none_when_empty() {
+        assert!(format_authors(&[]).is_none());
+    }
+
+    #[test]
+    fn extract_year_handles_zotero_date_shapes() {
+        assert_eq!(extract_year(Some("2017")).as_deref(), Some("2017"));
+        assert_eq!(extract_year(Some("2017-06-12")).as_deref(), Some("2017"));
+        assert_eq!(extract_year(Some("June 2017")).as_deref(), Some("2017"));
+        assert_eq!(extract_year(Some("Spring 1999")).as_deref(), Some("1999"));
+        assert_eq!(extract_year(Some("n.d.")), None);
+        assert_eq!(extract_year(None), None);
+        assert_eq!(extract_year(Some("99")), None);
     }
 }
