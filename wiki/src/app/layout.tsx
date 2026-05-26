@@ -21,6 +21,7 @@ import AuthGuard       from '@/components/AuthGuard'
 import ZoteroStatusBar from '@/components/ZoteroStatusBar'
 import OrganizeProgress from '@/components/OrganizeProgress'
 import Header          from '@/components/Header'
+import { PaperPreviewProvider } from '@/components/PaperPreviewContext'
 
 const geistSans = Geist({
   variable: '--font-geist-sans',
@@ -54,12 +55,14 @@ export default function RootLayout({
           on /onboarding (they check pathname internally).
         */}
         <AuthGuard>
-          <ZoteroStatusBar />
-          <Header />
-          <main className="flex-1">
-            {children}
-          </main>
-          <OrganizeProgress />
+          <PaperPreviewProvider>
+            <ZoteroStatusBar />
+            <Header />
+            <main className="flex-1">
+              {children}
+            </main>
+            <OrganizeProgress />
+          </PaperPreviewProvider>
         </AuthGuard>
       </body>
     </html>

@@ -27,6 +27,7 @@ import {
   type PaperMeta,
   type UnclassifiedPaper,
 } from '@/lib/content'
+import { usePaperPreview } from '@/components/PaperPreviewContext'
 
 type OrganizeState =
   | { kind: 'idle' }
@@ -63,6 +64,14 @@ function countAllNodes(tree: CategoryNode[]): number {
 }
 
 export default function DashboardPage() {
+  const { openPreview } = usePaperPreview()
+
+  const handlePaperClick = useCallback((e: React.MouseEvent, paper: PaperMeta) => {
+    if (e.metaKey || e.ctrlKey || e.button === 1) return
+    e.preventDefault()
+    openPreview(paper)
+  }, [openPreview])
+
   const [categoryTree, setCategoryTree] = useState<CategoryNode[]>([])
   const [recent, setRecent] = useState<PaperMeta[]>([])
   const [pending, setPending] = useState<UnclassifiedPaper[]>([])
@@ -426,6 +435,7 @@ export default function DashboardPage() {
                   <li key={`${p.category}/${p.slug}`}>
                     <Link
                       href={`/papers/${encodeURIComponent(p.slug)}`}
+                      onClick={(e) => handlePaperClick(e, p)}
                       className="flex items-baseline justify-between gap-3 px-4 py-3 transition-colors hover:bg-zinc-50 dark:hover:bg-zinc-800/50"
                     >
                       <div className="min-w-0 flex-1">
@@ -468,6 +478,7 @@ export default function DashboardPage() {
                 <li key={`${p.category}/${p.slug}`}>
                   <Link
                     href={`/papers/${encodeURIComponent(p.slug)}`}
+                    onClick={(e) => handlePaperClick(e, p)}
                     className="flex items-baseline justify-between gap-3 px-4 py-3 transition-colors hover:bg-zinc-50 dark:hover:bg-zinc-800/50"
                   >
                     <div className="min-w-0 flex-1">

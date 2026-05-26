@@ -7,17 +7,26 @@
  * tag filter controls.  Reads via `listPapersInCategory()`.
  */
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, useCallback } from 'react'
 import Link from 'next/link'
 import {
   listPapersInCategory,
   formatDate,
   type PaperMeta,
 } from '@/lib/content'
+import { usePaperPreview } from '@/components/PaperPreviewContext'
 
 type SortKey = 'date' | 'year' | 'title'
 
 export default function CategoryView({ category }: { category: string }) {
+  const { openPreview } = usePaperPreview()
+
+  const handlePaperClick = useCallback((e: React.MouseEvent, paper: PaperMeta) => {
+    if (e.metaKey || e.ctrlKey || e.button === 1) return
+    e.preventDefault()
+    openPreview(paper)
+  }, [openPreview])
+
   const [papers, setPapers] = useState<PaperMeta[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -186,6 +195,7 @@ export default function CategoryView({ category }: { category: string }) {
             <li key={p.slug}>
               <Link
                 href={`/papers/${encodeURIComponent(p.slug)}`}
+                onClick={(e) => handlePaperClick(e, p)}
                 className="block px-4 py-3 transition-colors hover:bg-zinc-50 dark:hover:bg-zinc-800/50"
               >
                 <div className="flex flex-wrap items-baseline justify-between gap-2">
