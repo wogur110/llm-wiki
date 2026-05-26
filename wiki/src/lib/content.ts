@@ -17,6 +17,24 @@ export interface CategoryInfo {
   latest_paper_date: string | null
 }
 
+/**
+ * One node in the nested category tree returned by `list_category_tree`.
+ *
+ * A node is a **branch** when `children.length > 0` (clicking expands it) or a
+ * **leaf** when `children` is empty (clicking shows that category's papers).
+ */
+export interface CategoryNode {
+  name: string
+  /** Relative path from `content/papers/` using `/` separators. */
+  path: string
+  /** Papers directly in this folder (not in child folders). */
+  paper_count: number
+  /** Papers in this folder AND all descendants. */
+  total_paper_count: number
+  latest_paper_date: string | null
+  children: CategoryNode[]
+}
+
 interface RawPaperFrontmatter {
   slug: string
   category: string
@@ -169,6 +187,16 @@ function requireRoot(): string {
 export async function listCategories(): Promise<CategoryInfo[]> {
   const contentRoot = requireRoot()
   return await invoke<CategoryInfo[]>('list_categories', { contentRoot })
+}
+
+/**
+ * Return the full nested category tree.  Each node carries a `path` relative
+ * to `content/papers/` (e.g. `"machine-learning/deep-learning"`) that can be
+ * passed directly to `listPapersInCategory`.
+ */
+export async function listCategoryTree(): Promise<CategoryNode[]> {
+  const contentRoot = requireRoot()
+  return await invoke<CategoryNode[]>('list_category_tree', { contentRoot })
 }
 
 export async function listPapersInCategory(

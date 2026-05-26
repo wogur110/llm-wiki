@@ -18,12 +18,12 @@ import Link from 'next/link'
 import { invoke } from '@tauri-apps/api/core'
 
 import {
-  listCategories,
+  listCategoryTree,
   listRecentPapers,
   listUnclassified,
   listPapersInCategory,
   formatRelative,
-  type CategoryInfo,
+  type CategoryNode,
   type PaperMeta,
   type UnclassifiedPaper,
 } from '@/lib/content'
@@ -57,8 +57,13 @@ interface ZoteroPdfImportEntry {
   collection_name: string | null
 }
 
+/** Count the total number of nodes in a category tree (all levels). */
+function countAllNodes(tree: CategoryNode[]): number {
+  return tree.reduce((acc, n) => acc + 1 + countAllNodes(n.children), 0)
+}
+
 export default function DashboardPage() {
-  const [categories, setCategories] = useState<CategoryInfo[]>([])
+  const [categoryTree, setCategoryTree] = useState<CategoryNode[]>([])
   const [recent, setRecent] = useState<PaperMeta[]>([])
   const [pending, setPending] = useState<UnclassifiedPaper[]>([])
   const [loading, setLoading] = useState(true)
@@ -67,16 +72,31 @@ export default function DashboardPage() {
   const [importState, setImportState] = useState<ImportState>({ kind: 'idle' })
   const [syncState, setSyncState] = useState<SyncState>({ kind: 'idle' })
 
-  // ── Inline category drilldown ─────────────────────────────────────────
+  // ── Category tree navigation ──────────────────────────────────────────
+  /** Paths of branch nodes that are currently expanded. */
+  const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set())
+  /** Path of the leaf node whose papers are being shown, or null. */
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null)
   const [categoryPapers, setCategoryPapers] = useState<PaperMeta[]>([])
   const [loadingCategoryPapers, setLoadingCategoryPapers] = useState(false)
 
-  const handleSelectCategory = useCallback(async (name: string) => {
-    setSelectedCategory(name)
+  const handleToggleExpand = useCallback((path: string) => {
+    setExpandedPaths((prev) => {
+      const next = new Set(prev)
+      if (next.has(path)) {
+        next.delete(path)
+      } else {
+        next.add(path)
+      }
+      return next
+    })
+  }, [])
+
+  const handleSelectCategory = useCallback(async (path: string) => {
+    setSelectedCategory(path)
     setLoadingCategoryPapers(true)
     try {
-      const papers = await listPapersInCategory(name)
+      const papers = await listPapersInCategory(path)
       setCategoryPapers(papers)
     } catch {
       setCategoryPapers([])
@@ -95,12 +115,12 @@ export default function DashboardPage() {
     setLoading(true)
     setLoadError(null)
     try {
-      const [cats, rec, un] = await Promise.all([
-        listCategories(),
+      const [tree, rec, un] = await Promise.all([
+        listCategoryTree(),
         listRecentPapers(8),
         listUnclassified(),
       ])
-      setCategories(cats)
+      setCategoryTree(tree)
       setRecent(rec)
       setPending(un)
     } catch (e) {
@@ -287,7 +307,7 @@ export default function DashboardPage() {
             대시보드
           </h1>
           <p className="mt-1 text-sm text-zinc-500">
-            카테고리 {categories.length}개 · 최근 추가 {recent.length}개 ·
+            카테고리 {countAllNodes(categoryTree)}개 · 최근 추가 {recent.length}개 ·
             정리 대기 {pending.length}개
           </p>
         </div>
@@ -352,20 +372,42 @@ export default function DashboardPage() {
         </div>
       )}
 
-      {/* ── Category section — grid or drilldown ─────────────────────── */}
+      {/* ── Category section — tree + optional paper drilldown ──────── */}
       <section>
-        {selectedCategory ? (
-          // ── Drilldown: papers in selected category ────────────────────
-          <>
+        <SectionHeading title="카테고리" />
+
+        {loading && categoryTree.length === 0 ? (
+          <SkeletonList />
+        ) : categoryTree.length === 0 ? (
+          <EmptyState message="아직 분류된 논문이 없습니다. 정리 대기 중인 파일을 처리해 보세요." />
+        ) : (
+          <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 overflow-hidden">
+            {categoryTree.map((node) => (
+              <CategoryTreeRow
+                key={node.path}
+                node={node}
+                depth={0}
+                expandedPaths={expandedPaths}
+                selectedPath={selectedCategory}
+                onToggle={handleToggleExpand}
+                onSelect={handleSelectCategory}
+              />
+            ))}
+          </div>
+        )}
+
+        {/* ── Paper list for the selected leaf category ─────────────── */}
+        {selectedCategory && (
+          <div className="mt-4">
             <div className="mb-3 flex items-center gap-3">
               <button
                 type="button"
                 onClick={handleBackToCategories}
                 className="flex items-center gap-1 rounded-md px-2.5 py-1 text-xs font-medium text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors"
               >
-                ← 카테고리 목록
+                ← 목록으로
               </button>
-              <h2 className="text-xs font-semibold uppercase tracking-wider text-zinc-500">
+              <h2 className="text-xs font-semibold text-zinc-500">
                 {selectedCategory}
               </h2>
               {!loadingCategoryPapers && (
@@ -408,42 +450,7 @@ export default function DashboardPage() {
                 ))}
               </ul>
             )}
-          </>
-        ) : (
-          // ── Category grid ──────────────────────────────────────────────
-          <>
-            <SectionHeading title="카테고리" />
-            {loading && categories.length === 0 ? (
-              <SkeletonGrid />
-            ) : categories.length === 0 ? (
-              <EmptyState message="아직 분류된 논문이 없습니다. 정리 대기 중인 파일을 처리해 보세요." />
-            ) : (
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-                {categories.map((c) => (
-                  <button
-                    key={c.name}
-                    type="button"
-                    onClick={() => handleSelectCategory(c.name)}
-                    className="group rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-4 text-left transition-all hover:border-blue-400 dark:hover:border-blue-600 hover:shadow-md"
-                  >
-                    <div className="flex items-start justify-between gap-2">
-                      <h3 className="font-medium text-zinc-900 dark:text-zinc-100 break-all">
-                        {c.name}
-                      </h3>
-                      <span className="shrink-0 rounded-md bg-blue-50 dark:bg-blue-950 px-2 py-0.5 text-xs font-mono text-blue-700 dark:text-blue-300">
-                        {c.paper_count}
-                      </span>
-                    </div>
-                    <p className="mt-2 text-xs text-zinc-500">
-                      {c.latest_paper_date
-                        ? `최근 ${formatRelative(c.latest_paper_date)}`
-                        : '비어 있음'}
-                    </p>
-                  </button>
-                ))}
-              </div>
-            )}
-          </>
+          </div>
         )}
       </section>
 
@@ -508,19 +515,6 @@ function EmptyState({ message }: { message: string }) {
   return (
     <div className="rounded-xl border border-dashed border-zinc-300 dark:border-zinc-700 px-4 py-8 text-center text-sm text-zinc-500">
       {message}
-    </div>
-  )
-}
-
-function SkeletonGrid() {
-  return (
-    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-      {Array.from({ length: 3 }, (_, i) => (
-        <div
-          key={i}
-          className="h-24 animate-pulse rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900"
-        />
-      ))}
     </div>
   )
 }
@@ -639,6 +633,112 @@ function SyncButton({
     >
       Zotero 동기화
     </button>
+  )
+}
+
+// ── Category tree row ────────────────────────────────────────────────────────
+
+/**
+ * One row in the collapsible category tree.  Recursively renders children
+ * when the node is expanded.
+ *
+ * • **Branch** (`children.length > 0`): click toggles expand / collapse.
+ * • **Leaf** (`children` is empty): click selects the category and loads its papers.
+ *
+ * A node that has both direct papers AND child sub-categories is treated as a
+ * branch (clicking it expands rather than loading papers directly).  The
+ * `total_paper_count` badge on branch nodes shows the aggregate across all
+ * descendants.
+ */
+function CategoryTreeRow({
+  node,
+  depth,
+  expandedPaths,
+  selectedPath,
+  onToggle,
+  onSelect,
+}: {
+  node: CategoryNode
+  depth: number
+  expandedPaths: Set<string>
+  selectedPath: string | null
+  onToggle: (path: string) => void
+  onSelect: (path: string) => void
+}) {
+  const isLeaf = node.children.length === 0
+  const isExpanded = expandedPaths.has(node.path)
+  const isSelected = selectedPath === node.path
+
+  const indent = depth * 20  // px of left padding per nesting level
+
+  const handleClick = () => {
+    if (isLeaf) {
+      onSelect(node.path)
+    } else {
+      onToggle(node.path)
+    }
+  }
+
+  return (
+    <>
+      <button
+        type="button"
+        onClick={handleClick}
+        style={{ paddingLeft: `${12 + indent}px` }}
+        className={[
+          'flex w-full items-center gap-2 py-2.5 pr-4 text-left transition-colors',
+          'border-b border-zinc-100 dark:border-zinc-800/60 last:border-b-0',
+          isSelected
+            ? 'bg-blue-50 dark:bg-blue-950/40'
+            : 'hover:bg-zinc-50 dark:hover:bg-zinc-800/40',
+        ].join(' ')}
+      >
+        {/* Expand / collapse arrow or leaf dot */}
+        <span className="shrink-0 w-4 text-center text-[10px] text-zinc-400 dark:text-zinc-500">
+          {isLeaf ? '●' : isExpanded ? '▼' : '▶'}
+        </span>
+
+        {/* Folder name */}
+        <span
+          className={[
+            'flex-1 truncate text-sm',
+            isSelected
+              ? 'font-semibold text-blue-700 dark:text-blue-300'
+              : depth === 0
+                ? 'font-medium text-zinc-900 dark:text-zinc-100'
+                : 'text-zinc-700 dark:text-zinc-300',
+          ].join(' ')}
+        >
+          {node.name}
+        </span>
+
+        {/* Paper count badge — aggregate for branches, direct for leaves */}
+        <span className="shrink-0 rounded bg-blue-50 dark:bg-blue-950 px-1.5 py-0.5 text-[11px] font-mono text-blue-600 dark:text-blue-400">
+          {node.total_paper_count}
+        </span>
+
+        {/* Latest-paper date */}
+        {node.latest_paper_date && (
+          <span className="shrink-0 hidden sm:inline text-[11px] text-zinc-400 dark:text-zinc-500 min-w-[5rem] text-right">
+            {formatRelative(node.latest_paper_date)}
+          </span>
+        )}
+      </button>
+
+      {/* Children — rendered when expanded */}
+      {!isLeaf && isExpanded &&
+        node.children.map((child) => (
+          <CategoryTreeRow
+            key={child.path}
+            node={child}
+            depth={depth + 1}
+            expandedPaths={expandedPaths}
+            selectedPath={selectedPath}
+            onToggle={onToggle}
+            onSelect={onSelect}
+          />
+        ))}
+    </>
   )
 }
 

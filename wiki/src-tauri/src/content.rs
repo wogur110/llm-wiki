@@ -29,6 +29,7 @@ use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+use walkdir::WalkDir;
 
 /// Folders directly under `content/papers/` that are NOT user-facing categories.
 const EXCLUDED_TOP_LEVEL: &[&str] = &["unclassified", ".staging"];
@@ -43,6 +44,27 @@ pub struct CategoryInfo {
     pub paper_count: u32,
     /// Latest paper mtime as ISO 8601 string, or `None` if the category is empty.
     pub latest_paper_date: Option<String>,
+}
+
+/// One node in the nested category tree returned by `list_category_tree`.
+///
+/// A node is either a **branch** (has children, may also contain papers directly)
+/// or a **leaf** (`children` is empty).  Leaf nodes are the units you click to
+/// view papers; branch nodes expand/collapse.
+#[derive(Debug, Serialize, Clone)]
+pub struct CategoryNode {
+    /// Just this folder's name, e.g. `"deep-learning"`.
+    pub name: String,
+    /// Path relative to `content/papers/` using `/` separators,
+    /// e.g. `"machine-learning/deep-learning"`.
+    pub path: String,
+    /// Papers directly in this folder (excluding subdirectories).
+    pub paper_count: u32,
+    /// Papers in this folder **plus** all descendants — shown on branch nodes.
+    pub total_paper_count: u32,
+    pub latest_paper_date: Option<String>,
+    /// Immediate child categories, sorted by name.
+    pub children: Vec<CategoryNode>,
 }
 
 /// Lightweight paper descriptor used for list views.
@@ -125,6 +147,103 @@ fn read_markdown_paper(
 }
 
 // ── Tauri commands ────────────────────────────────────────────────────────────
+
+// ── Category tree helpers ──────────────────────────────────────────────────────
+
+/// Recursively build the category tree rooted at `dir`.
+///
+/// `papers_dir` is the absolute path of `content/papers/` and is used to
+/// compute `CategoryNode::path` (relative, forward-slash separated).
+fn build_category_tree(papers_dir: &Path, dir: &Path) -> Vec<CategoryNode> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return vec![];
+    };
+
+    let mut nodes = Vec::new();
+
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let entry_path = entry.path();
+
+        if !entry_path.is_dir() || !is_user_category(&name) {
+            continue;
+        }
+
+        // Relative path from papers_dir (forward-slash, e.g. "ml/deep-learning")
+        let rel_path = entry_path
+            .strip_prefix(papers_dir)
+            .map(|r| r.to_string_lossy().replace('\\', "/").to_owned())
+            .unwrap_or_else(|_| name.clone());
+
+        // Count papers directly in this folder (not in sub-folders)
+        let mut paper_count = 0u32;
+        let mut latest: Option<SystemTime> = None;
+
+        if let Ok(sub_entries) = fs::read_dir(&entry_path) {
+            for sub in sub_entries.flatten() {
+                let fname = sub.file_name().to_string_lossy().to_string();
+                if !fname.ends_with(".md") || fname.starts_with('.') {
+                    continue;
+                }
+                paper_count += 1;
+                if let Ok(t) = sub.metadata().and_then(|m| m.modified()) {
+                    if latest.map(|l| t > l).unwrap_or(true) {
+                        latest = Some(t);
+                    }
+                }
+            }
+        }
+
+        // Recurse into children first so we can aggregate their totals
+        let children = build_category_tree(papers_dir, &entry_path);
+
+        let child_total: u32 = children.iter().map(|c| c.total_paper_count).sum();
+        let total_paper_count = paper_count + child_total;
+
+        let self_latest = latest.map(|t| {
+            let dt: DateTime<Utc> = t.into();
+            dt.to_rfc3339()
+        });
+        let child_latest: Option<String> = children
+            .iter()
+            .filter_map(|c| c.latest_paper_date.clone())
+            .max();
+        let latest_paper_date = match (self_latest, child_latest) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+
+        nodes.push(CategoryNode {
+            name,
+            path: rel_path,
+            paper_count,
+            total_paper_count,
+            latest_paper_date,
+            children,
+        });
+    }
+
+    nodes.sort_by(|a, b| a.name.cmp(&b.name));
+    nodes
+}
+
+/// Return the full category tree rooted at `content/papers/`.
+///
+/// Each node carries a `path` relative to `papers/` using forward-slash
+/// separators, which can be passed directly to `list_papers_in_category`.
+/// Sorted alphabetically at every level.  Excludes `unclassified/` and
+/// `.staging/`.
+#[tauri::command]
+pub fn list_category_tree(content_root: String) -> Result<Vec<CategoryNode>, String> {
+    let papers_dir = PathBuf::from(&content_root).join("papers");
+    if !papers_dir.is_dir() {
+        return Err(format!(
+            "papers directory not found: {}",
+            papers_dir.display()
+        ));
+    }
+    Ok(build_category_tree(&papers_dir, &papers_dir))
+}
 
 /// List every classified category folder under `content/papers/`.
 ///
@@ -217,7 +336,8 @@ pub fn list_papers_in_category(
 
 /// Top-N most recently modified papers across every category folder.
 ///
-/// Used by the dashboard "Recent additions" feed.
+/// Scans nested subdirectories recursively so papers in sub-categories are
+/// included.  Used by the dashboard "Recent additions" feed.
 #[tauri::command]
 pub fn list_recent_papers(
     content_root: String,
@@ -226,17 +346,32 @@ pub fn list_recent_papers(
     let papers_dir = PathBuf::from(&content_root).join("papers");
     let mut all: Vec<PaperFrontmatter> = Vec::new();
 
-    let entries = fs::read_dir(&papers_dir).map_err(|e| {
-        format!("read_dir failed for {}: {e}", papers_dir.display())
-    })?;
-
-    for entry in entries.flatten() {
-        let cat = entry.file_name().to_string_lossy().to_string();
-        if !is_user_category(&cat) || !entry.path().is_dir() {
+    for entry in WalkDir::new(&papers_dir)
+        .min_depth(2) // skip papers_dir itself and top-level dirs; files are min_depth=2
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy();
+            n.ends_with(".md") && !n.starts_with('.')
+        })
+    {
+        let path = entry.path();
+        let parent = match path.parent() {
+            Some(p) => p,
+            None => continue,
+        };
+        let rel = match parent.strip_prefix(&papers_dir) {
+            Ok(r) => r.to_string_lossy().replace('\\', "/").to_owned(),
+            Err(_) => continue,
+        };
+        // Skip system folders (unclassified, .staging, …)
+        let top = rel.split('/').next().unwrap_or(&rel);
+        if !is_user_category(top) || rel.is_empty() {
             continue;
         }
-        if let Ok(mut papers) = list_papers_in_category(content_root.clone(), cat) {
-            all.append(&mut papers);
+        if let Ok(paper) = read_markdown_paper(path, &rel) {
+            all.push(paper);
         }
     }
 
@@ -269,31 +404,41 @@ pub fn read_paper_file(
     })
 }
 
-/// Resolve a slug back to its containing category folder.
+/// Resolve a slug back to its containing category path.
 ///
 /// The single-paper route is `/papers/[slug]`, but the markdown file lives at
-/// `papers/<category>/<slug>.md` — this command scans the user-category
-/// folders to find the match.
+/// `papers/<category-path>/<slug>.md`.  Searches recursively so papers in
+/// nested sub-categories are found.  Returns a path relative to
+/// `content/papers/` using forward-slash separators.
 #[tauri::command]
 pub fn find_paper_category(
     content_root: String,
     slug: String,
 ) -> Result<String, String> {
     let papers_dir = PathBuf::from(&content_root).join("papers");
+    let target = format!("{slug}.md");
 
-    let entries = fs::read_dir(&papers_dir).map_err(|e| {
-        format!("read_dir failed for {}: {e}", papers_dir.display())
-    })?;
-
-    for entry in entries.flatten() {
-        let cat = entry.file_name().to_string_lossy().to_string();
-        if !is_user_category(&cat) || !entry.path().is_dir() {
+    for entry in WalkDir::new(&papers_dir)
+        .min_depth(2)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| e.file_name().to_string_lossy() == target.as_str())
+    {
+        let path = entry.path();
+        let parent = match path.parent() {
+            Some(p) => p,
+            None => continue,
+        };
+        let rel = match parent.strip_prefix(&papers_dir) {
+            Ok(r) => r.to_string_lossy().replace('\\', "/").to_owned(),
+            Err(_) => continue,
+        };
+        let top = rel.split('/').next().unwrap_or(&rel);
+        if !is_user_category(top) || rel.is_empty() {
             continue;
         }
-        let candidate = entry.path().join(format!("{slug}.md"));
-        if candidate.exists() {
-            return Ok(cat);
-        }
+        return Ok(rel);
     }
     Err(format!("Paper not found: {slug}"))
 }
@@ -535,5 +680,111 @@ mod tests {
         fs::create_dir_all(root.join("meta")).unwrap();
         let json = read_backlinks(root.to_string_lossy().to_string()).unwrap();
         assert_eq!(json, "{}");
+    }
+
+    // ── CategoryNode tree tests ────────────────────────────────────────────────
+
+    /// Flat structure: one top-level category → tree should have one root node,
+    /// no children, and the same paper count as `list_categories`.
+    #[test]
+    fn list_category_tree_flat_structure() {
+        let (_dir, root) = fixture_root();
+        let tree = list_category_tree(root).unwrap();
+        assert_eq!(tree.len(), 1);
+        let node = &tree[0];
+        assert_eq!(node.name, "large-language-models");
+        assert_eq!(node.path, "large-language-models");
+        assert_eq!(node.paper_count, 2);
+        assert_eq!(node.total_paper_count, 2);
+        assert!(node.children.is_empty());
+        assert!(node.latest_paper_date.is_some());
+    }
+
+    /// Nested structure: parent folder + child sub-folder.
+    /// Aggregate paper counts must bubble up correctly.
+    #[test]
+    fn list_category_tree_nested_structure() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("content");
+        let papers = root.join("papers");
+
+        // parent folder with 1 direct paper
+        let ml = papers.join("ml");
+        fs::create_dir_all(&ml).unwrap();
+        fs::write(ml.join("survey.md"), "---\ntitle: Survey\n---\n").unwrap();
+
+        // child sub-folder with 2 papers
+        let llm = ml.join("llm");
+        fs::create_dir_all(&llm).unwrap();
+        fs::write(llm.join("gpt.md"), "---\ntitle: GPT\n---\n").unwrap();
+        fs::write(llm.join("bert.md"), "---\ntitle: BERT\n---\n").unwrap();
+
+        // unrelated root category (should be a sibling root node)
+        let cv = papers.join("computer-vision");
+        fs::create_dir_all(&cv).unwrap();
+        fs::write(cv.join("resnet.md"), "---\ntitle: ResNet\n---\n").unwrap();
+
+        let root_str = root.to_string_lossy().to_string();
+        let tree = list_category_tree(root_str).unwrap();
+
+        // Two root nodes: "computer-vision" and "ml" (sorted)
+        assert_eq!(tree.len(), 2);
+        let cv_node = tree.iter().find(|n| n.name == "computer-vision").unwrap();
+        let ml_node = tree.iter().find(|n| n.name == "ml").unwrap();
+
+        assert_eq!(cv_node.paper_count, 1);
+        assert_eq!(cv_node.total_paper_count, 1);
+        assert!(cv_node.children.is_empty());
+
+        // "ml" has 1 direct paper + 2 in "llm" child
+        assert_eq!(ml_node.paper_count, 1);
+        assert_eq!(ml_node.total_paper_count, 3);
+        assert_eq!(ml_node.children.len(), 1);
+
+        let llm_node = &ml_node.children[0];
+        assert_eq!(llm_node.name, "llm");
+        assert_eq!(llm_node.path, "ml/llm");
+        assert_eq!(llm_node.paper_count, 2);
+        assert_eq!(llm_node.total_paper_count, 2);
+        assert!(llm_node.children.is_empty());
+    }
+
+    /// `find_paper_category` must return the relative nested path, not just
+    /// the top-level folder name.
+    #[test]
+    fn find_paper_category_nested_path() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("content");
+        let papers = root.join("papers");
+        let nested = papers.join("ml").join("llm");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("gpt.md"), "---\ntitle: GPT\n---\n").unwrap();
+
+        let root_str = root.to_string_lossy().to_string();
+        let cat = find_paper_category(root_str, "gpt".into()).unwrap();
+        assert_eq!(cat, "ml/llm");
+    }
+
+    /// `list_recent_papers` must find papers in nested sub-directories.
+    #[test]
+    fn list_recent_papers_recurses_nested_folders() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("content");
+        let papers = root.join("papers");
+
+        let nested = papers.join("ml").join("llm");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("gpt.md"), "---\ntitle: GPT\n---\n").unwrap();
+
+        let top_level = papers.join("computer-vision");
+        fs::create_dir_all(&top_level).unwrap();
+        fs::write(top_level.join("resnet.md"), "---\ntitle: ResNet\n---\n").unwrap();
+
+        let root_str = root.to_string_lossy().to_string();
+        let recent = list_recent_papers(root_str, 10).unwrap();
+        assert_eq!(recent.len(), 2);
+        let slugs: Vec<_> = recent.iter().map(|p| p.slug.as_str()).collect();
+        assert!(slugs.contains(&"gpt"));
+        assert!(slugs.contains(&"resnet"));
     }
 }

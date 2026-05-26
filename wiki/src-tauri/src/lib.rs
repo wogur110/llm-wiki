@@ -226,6 +226,7 @@ pub fn run() {
             // ── Organiser ─────────────────────────────────────────────────
             organizer::process_paper,
             // ── Content reader ────────────────────────────────────────────
+            content::list_category_tree,
             content::list_categories,
             content::list_papers_in_category,
             content::list_recent_papers,
