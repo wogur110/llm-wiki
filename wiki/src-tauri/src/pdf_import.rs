@@ -349,16 +349,16 @@ fn dedup_zotero_entries(
                 return None;
             }
 
-            // Filter out the Unclassified collection name — items from it
-            // should be classified by Gemini, not placed in an "unclassified"
-            // category folder.
-            let collection_name = entry.collection_name.and_then(|name| {
-                if name.to_lowercase() == "unclassified" {
-                    None
-                } else {
-                    Some(name)
-                }
-            });
+            // Sanitize the nested collection path for filesystem use while
+            // preserving the user's preferred capitalisation and underscores
+            // ("Computer Vision/01_Generative_Models/Autoencoders" stays
+            // verbatim, only forbidden chars are stripped).  Items in the
+            // top-level "Unclassified" Zotero collection get `None` so they
+            // run through Gemini classification instead of being placed in
+            // a literal "Unclassified" folder.
+            let collection_name = entry
+                .collection_name
+                .and_then(|path| sanitize_collection_path(&path));
 
             Some(ZoteroPdfImportEntry {
                 item_key: entry.item_key,
@@ -372,6 +372,47 @@ fn dedup_zotero_entries(
 
     out.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
     out
+}
+
+/// Sanitise a `/`-separated Zotero collection path for use as a wiki folder
+/// path.  Returns `None` when the path collapses to nothing or to a single
+/// `Unclassified` segment (those items belong in the Gemini-classification
+/// flow, not in a literal `unclassified/` folder).
+pub(crate) fn sanitize_collection_path(raw: &str) -> Option<String> {
+    let segments: Vec<String> = raw
+        .split('/')
+        .map(sanitize_path_segment)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if segments.is_empty() {
+        return None;
+    }
+
+    // Single "Unclassified" segment (case-insensitive) → return None so the
+    // importer treats the item as new-and-unclassified.  Nested paths that
+    // *contain* "Unclassified" deeper in the hierarchy are kept as-is.
+    if segments.len() == 1 && segments[0].eq_ignore_ascii_case("unclassified") {
+        return None;
+    }
+
+    Some(segments.join("/"))
+}
+
+/// Strip filesystem-unsafe characters from one path segment without losing
+/// the original capitalisation, spaces, or underscores that the user
+/// presumably chose on purpose in Zotero.
+///
+/// Removes the Windows-reserved set `< > : " | ? *`, NULs, and any embedded
+/// path separators.  Collapses runs of whitespace and trims leading/trailing
+/// dots and spaces (Windows would otherwise refuse to create the directory).
+pub(crate) fn sanitize_path_segment(seg: &str) -> String {
+    let cleaned: String = seg
+        .chars()
+        .filter(|c| !matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*' | '\\' | '/' | '\0'))
+        .collect();
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed.trim_matches(|c: char| c == '.' || c.is_whitespace()).to_string()
 }
 
 /// All metadata required to build a frontmatter-only markdown stub.
@@ -763,6 +804,42 @@ mod tests {
     #[test]
     fn format_authors_returns_none_when_empty() {
         assert!(format_authors(&[]).is_none());
+    }
+
+    #[test]
+    fn sanitize_path_segment_preserves_capitals_and_spaces() {
+        assert_eq!(sanitize_path_segment("Computer Vision"), "Computer Vision");
+        assert_eq!(sanitize_path_segment("01_Generative_Models"), "01_Generative_Models");
+        assert_eq!(sanitize_path_segment("Autoencoders"), "Autoencoders");
+    }
+
+    #[test]
+    fn sanitize_path_segment_strips_forbidden_chars() {
+        assert_eq!(sanitize_path_segment("a<b>c"), "abc");
+        assert_eq!(sanitize_path_segment("foo/bar"), "foobar");
+        assert_eq!(sanitize_path_segment("trailing dots..."), "trailing dots");
+        assert_eq!(sanitize_path_segment("  spaced  out  "), "spaced out");
+    }
+
+    #[test]
+    fn sanitize_collection_path_preserves_nested_zotero_layout() {
+        let path = "Computer Vision/01_Generative_Models/Autoencoders";
+        let out = sanitize_collection_path(path).unwrap();
+        assert_eq!(out, "Computer Vision/01_Generative_Models/Autoencoders");
+    }
+
+    #[test]
+    fn sanitize_collection_path_drops_top_unclassified() {
+        assert!(sanitize_collection_path("Unclassified").is_none());
+        assert!(sanitize_collection_path("unclassified").is_none());
+        assert!(sanitize_collection_path("").is_none());
+    }
+
+    #[test]
+    fn sanitize_collection_path_keeps_unclassified_when_nested() {
+        let path = "Computer Vision/Unclassified";
+        let out = sanitize_collection_path(path).unwrap();
+        assert_eq!(out, "Computer Vision/Unclassified");
     }
 
     #[test]

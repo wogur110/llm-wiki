@@ -466,6 +466,12 @@ where
     // ──────────────────────────────────────────────────────────────────────────
     emit_fn("GeminiClassified", "started", None);
 
+    // `category_override` doubles as a signal that the caller already knows
+    // the paper's Zotero collection (i.e. we are importing an existing
+    // library entry).  In that case we trust Zotero's state and skip the
+    // collection-update step further down.
+    let category_overridden = gemini_override.is_some();
+
     let category = match gemini_override {
         Some(override_result) => match override_result {
             Ok(cat) => cat,
@@ -570,7 +576,32 @@ where
     //   3. title (fallback when Gemini failed to extract a DOI).
     // If none resolve to a Zotero item the step is skipped and ZotMoov
     // confirmation is skipped along with it.
+    //
+    // When the caller supplied a category override (library-import flow),
+    // we know the item is already in its target Zotero collection — sending
+    // a `update_collection` with a nested path like "Computer Vision/01_…"
+    // would fail because the Zotero local API only addresses collections by
+    // leaf name.  Skip both Zotero steps in that case.
     // ──────────────────────────────────────────────────────────────────────────
+    if category_overridden {
+        emit_fn(
+            "ZoteroCollectionChanged",
+            "skipped",
+            Some("category override — item already in its Zotero collection"),
+        );
+        emit_fn("ZotMovConfirmed", "skipped", Some("category override"));
+        if let Some(ref doi) = fm.doi {
+            let _ = record_doi_processed(&config.dois_path(), doi, &target_str, &category);
+        }
+        log_success(&config, &target_str, &category);
+        return Ok(ProcessResult {
+            category,
+            final_path: target_path.to_string_lossy().into_owned(),
+            zotero_synced: false,
+            zotero_pending: false,
+        });
+    }
+
     emit_fn("ZoteroCollectionChanged", "started", None);
 
     let lookup_result = crate::zotero::lookup_item_for_organizer(

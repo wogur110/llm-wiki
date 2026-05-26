@@ -150,6 +150,12 @@ struct ZoteroCollection {
 #[derive(Debug, Deserialize)]
 struct ZoteroCollectionData {
     name: String,
+    /// Zotero serialises this as `false` for top-level collections and as
+    /// the parent collection's key string otherwise.  `serde_json::Value`
+    /// lets us tolerate both without a custom deserialiser.
+    #[serde(rename = "parentCollection", default)]
+    #[allow(dead_code)]
+    parent_collection: serde_json::Value,
 }
 
 // ── Client helper ─────────────────────────────────────────────────────────────
@@ -262,20 +268,21 @@ pub(crate) async fn ensure_collection(
     Ok(key)
 }
 
-/// Fetch all Zotero collections and return a `key → name` map.
+/// Fetch all Zotero collections and return a `key → full nested path` map.
+///
+/// The path is built by walking each collection's `parentCollection` chain
+/// up to the root and joining the names with `/`.  For Zotero structure
+/// `Computer Vision > 01_Generative_Models > Autoencoders` this returns
+/// `"Computer Vision/01_Generative_Models/Autoencoders"`.
 ///
 /// Returns an empty map on any network or parse error so callers can
 /// degrade gracefully (items will have `collection_name = None`).
-pub(crate) async fn fetch_collections_map(client: &Client) -> HashMap<String, String> {
+pub(crate) async fn fetch_collection_paths_map(client: &Client) -> HashMap<String, String> {
     let resp: serde_json::Value = match client
         .get(format!("{ZOTERO_API}/collections"))
         .send()
         .await
-        .and_then(|r| {
-            // We need an async `.json()` but we're in a sync context here —
-            // chain via the future produced by `.json()`.
-            Ok(r)
-        }) {
+    {
         Ok(r) => match r.error_for_status() {
             Ok(r) => match r.json::<serde_json::Value>().await {
                 Ok(v) => v,
@@ -286,18 +293,56 @@ pub(crate) async fn fetch_collections_map(client: &Client) -> HashMap<String, St
         Err(_) => return HashMap::new(),
     };
 
-    let mut map = HashMap::new();
+    // First pass: collect `(key, name, parent_key)` for every collection.
+    let mut nodes: HashMap<String, (String, Option<String>)> = HashMap::new();
     if let Some(arr) = resp.as_array() {
         for col in arr {
-            if let (Some(key), Some(name)) = (
-                col["key"].as_str(),
-                col["data"]["name"].as_str(),
-            ) {
-                map.insert(key.to_string(), name.to_string());
-            }
+            let key = match col["key"].as_str() {
+                Some(k) => k.to_string(),
+                None => continue,
+            };
+            let name = match col["data"]["name"].as_str() {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            // parentCollection is either `false` (top-level) or a key string.
+            let parent = col["data"]["parentCollection"].as_str().map(str::to_string);
+            nodes.insert(key, (name, parent));
         }
     }
-    map
+
+    build_collection_paths(&nodes)
+}
+
+/// Pure helper for `fetch_collection_paths_map` — easy to unit-test.
+///
+/// Walks each entry's parent chain (guarding against cycles) and returns a
+/// `key → "Parent/Child/Grandchild"` map.  Each entry is `(name, parent_key)`.
+pub(crate) fn build_collection_paths(
+    nodes: &HashMap<String, (String, Option<String>)>,
+) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::with_capacity(nodes.len());
+
+    for key in nodes.keys() {
+        let mut chain: Vec<&str> = Vec::new();
+        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut cursor: Option<&str> = Some(key.as_str());
+        while let Some(k) = cursor {
+            if !visited.insert(k) {
+                // Cycle — bail out and keep what we have.
+                break;
+            }
+            let Some((name, parent)) = nodes.get(k) else {
+                break;
+            };
+            chain.push(name.as_str());
+            cursor = parent.as_deref();
+        }
+        chain.reverse();
+        out.insert(key.clone(), chain.join("/"));
+    }
+
+    out
 }
 
 // ── Tauri commands ────────────────────────────────────────────────────────────
@@ -616,9 +661,17 @@ pub async fn list_collection_pdf_items(
         .await
         .map_err(|e| format!("JSON decode error: {e}"))?;
 
-    // All items from this endpoint belong to the queried collection.
-    // Passing the collection name as override so every entry gets it.
-    Ok(resolve_pdf_entries(&client, top_items, &HashMap::new(), Some(name)).await)
+    // Resolve the queried collection's full nested path so items returned
+    // here pick up the same parent chain as items returned by the
+    // entire-library listing.  Falls back to the leaf name if anything
+    // unexpected happens.
+    let paths_map = fetch_collection_paths_map(&client).await;
+    let full_path = paths_map
+        .get(&col_key)
+        .cloned()
+        .unwrap_or_else(|| name.to_string());
+
+    Ok(resolve_pdf_entries(&client, top_items, &HashMap::new(), Some(&full_path)).await)
 }
 
 /// List every top-level item in the **entire** user library together with its
@@ -632,9 +685,9 @@ pub async fn list_collection_pdf_items(
 pub async fn list_all_pdf_items() -> Result<Vec<ZoteroPdfEntry>, String> {
     let client = build_client();
 
-    // Fetch all collections upfront so we can resolve each item's collection
-    // name in O(1) without extra HTTP requests per item.
-    let collections_map = fetch_collections_map(&client).await;
+    // Fetch all collections upfront so we can resolve each item's full
+    // nested collection path in O(1) without extra HTTP requests per item.
+    let collections_map = fetch_collection_paths_map(&client).await;
 
     let top_items: Vec<serde_json::Value> = client
         .get(format!("{ZOTERO_API}/items/top"))
@@ -1006,6 +1059,61 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("collection"));
+    }
+
+    /// Flat collections (no parents) map to their own leaf name.
+    #[test]
+    fn build_collection_paths_handles_flat_collections() {
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "K1".to_string(),
+            ("Computer Vision".to_string(), None),
+        );
+        nodes.insert("K2".to_string(), ("NLP".to_string(), None));
+
+        let paths = build_collection_paths(&nodes);
+        assert_eq!(paths.get("K1").map(String::as_str), Some("Computer Vision"));
+        assert_eq!(paths.get("K2").map(String::as_str), Some("NLP"));
+    }
+
+    /// Nested chains are joined with `/`, parent → child → grandchild.
+    #[test]
+    fn build_collection_paths_walks_parent_chain() {
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "K1".to_string(),
+            ("Computer Vision".to_string(), None),
+        );
+        nodes.insert(
+            "K2".to_string(),
+            ("01_Generative_Models".to_string(), Some("K1".to_string())),
+        );
+        nodes.insert(
+            "K3".to_string(),
+            ("Autoencoders".to_string(), Some("K2".to_string())),
+        );
+
+        let paths = build_collection_paths(&nodes);
+        assert_eq!(
+            paths.get("K3").map(String::as_str),
+            Some("Computer Vision/01_Generative_Models/Autoencoders"),
+        );
+        assert_eq!(
+            paths.get("K2").map(String::as_str),
+            Some("Computer Vision/01_Generative_Models"),
+        );
+    }
+
+    /// A pathological self-loop must not hang the resolver.
+    #[test]
+    fn build_collection_paths_breaks_cycles() {
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            "A".to_string(),
+            ("Loop".to_string(), Some("A".to_string())),
+        );
+        let paths = build_collection_paths(&nodes);
+        assert_eq!(paths.get("A").map(String::as_str), Some("Loop"));
     }
 
     /// `wait_for_zotmoov` must time out and return `Err` when the target path
