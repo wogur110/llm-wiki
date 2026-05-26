@@ -20,7 +20,19 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tokio::time::{sleep, Duration, Instant};
 
-pub const ZOTERO_API: &str = "http://localhost:23119/api";
+/// Web-API-compatible base URL for the local Zotero library.
+///
+/// The local HTTP server mirrors the public Web API routing, so every data
+/// endpoint (`/items`, `/collections`, …) must be prefixed with a library
+/// identifier.  The local user library is always `users/0`; group libraries
+/// would use `groups/<id>` but LLM-Wiki only operates on the personal
+/// library.  Hitting the bare `/api/collections` returns HTTP 404.
+pub const ZOTERO_API: &str = "http://localhost:23119/api/users/0";
+
+/// Root API URL — used only for connectivity probes (`check_status`, `ping`).
+/// Data endpoints must use [`ZOTERO_API`] which includes the library prefix.
+const ZOTERO_API_ROOT: &str = "http://localhost:23119/api";
+
 pub const POLL_INTERVAL_SECS: u64 = 30;
 
 /// Hard timeout for a single Zotero HTTP request (connect + read).
@@ -126,10 +138,14 @@ fn build_client() -> Client {
 
 /// Returns `true` if the Zotero local server answers with HTTP 2xx.
 ///
+/// Probes the API *root* (not a data endpoint) — Zotero returns 200 for
+/// `/api/` as soon as it is running and the "Allow other applications…"
+/// preference is enabled.
+///
 /// Used by the pending-sync poller to gate retry attempts.
 pub(crate) async fn ping(client: &Client) -> bool {
     client
-        .get(format!("{ZOTERO_API}/"))
+        .get(format!("{ZOTERO_API_ROOT}/"))
         .send()
         .await
         .map(|r| r.status().is_success())
@@ -212,7 +228,7 @@ pub(crate) async fn ensure_collection(
 #[tauri::command]
 pub async fn check_status() -> ZoteroStatus {
     let client = build_client();
-    match client.get(format!("{ZOTERO_API}/")).send().await {
+    match client.get(format!("{ZOTERO_API_ROOT}/")).send().await {
         // Connection refused or hard timeout → Zotero is not running.
         Err(e) if e.is_connect() || e.is_timeout() => ZoteroStatus::Disconnected,
         // Other transport/TLS errors.
