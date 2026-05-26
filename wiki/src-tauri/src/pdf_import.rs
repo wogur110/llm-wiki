@@ -394,57 +394,6 @@ fn dedup_zotero_entries(
     out
 }
 
-/// List the category folder names currently under `content/papers/`.
-///
-/// Excludes hidden directories (`.staging`) and the `unclassified` folder.
-/// Returns an empty `Vec` if `papers/` does not exist.
-fn list_existing_categories(content_root: &str) -> Vec<String> {
-    let papers_dir = PathBuf::from(content_root).join("papers");
-    if !papers_dir.is_dir() {
-        return vec![];
-    }
-    let mut cats = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&papers_dir) {
-        for entry in entries.filter_map(Result::ok) {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            if is_dir && !name.starts_with('.') && name != "unclassified" {
-                cats.push(name);
-            }
-        }
-    }
-    cats.sort();
-    cats
-}
-
-/// Extract `title` and `abstract` values from a markdown document's YAML
-/// frontmatter (the `---` block at the top).
-///
-/// Returns empty strings for any field that cannot be found.
-fn extract_title_and_abstract(markdown: &str) -> (String, String) {
-    let mut title = String::new();
-    let mut abstract_text = String::new();
-
-    if !markdown.starts_with("---") {
-        return (title, abstract_text);
-    }
-
-    let after_open = markdown.trim_start_matches("---\n");
-    let end = after_open.find("\n---").unwrap_or(after_open.len());
-    let yaml = &after_open[..end];
-
-    for line in yaml.lines() {
-        let t = line.trim();
-        if let Some(v) = t.strip_prefix("title:") {
-            title = v.trim().trim_matches('"').trim_matches('\'').to_string();
-        } else if let Some(v) = t.strip_prefix("abstract:") {
-            abstract_text = v.trim().trim_matches('"').trim_matches('\'').to_string();
-        }
-    }
-
-    (title, abstract_text)
-}
-
 /// Import a single Zotero item: download its PDF attachment, convert to
 /// markdown with Gemini, write to `content/papers/unclassified/<slug>.md` with
 /// `zotero_key` injected into the frontmatter, then run the organiser
@@ -461,8 +410,10 @@ fn extract_title_and_abstract(markdown: &str) -> (String, String) {
 ///   flow where the paper's Zotero collection is already known.  The Gemini
 ///   classification call is skipped entirely and `cat` is used directly.
 /// * `override_category = None` — used by the "import unclassified" flow.
-///   Existing wiki categories are listed and passed to Gemini as hints so the
-///   model prefers them over inventing new names.
+///   `process_paper_core` calls Gemini for classification after the markdown
+///   file is written to disk.  This keeps the total number of Gemini calls at
+///   two per item (PDF → markdown + classify) and avoids the 429 rate-limit
+///   that a third back-to-back call would trigger on the free tier.
 #[tauri::command]
 pub async fn import_zotero_item_and_organize(
     item_key: String,
@@ -491,36 +442,17 @@ pub async fn import_zotero_item_and_organize(
         slug
     };
 
-    // ── Determine category before writing to disk ─────────────────────────
+    // ── Determine category override ───────────────────────────────────────
     //
-    // We pre-determine the category here (one Gemini call total) and pass it
-    // to `process_paper_core` as a `gemini_override` so the core pipeline
-    // does not issue a second classification call.
-    let gemini_override: Option<Result<String, String>> = if let Some(cat) = override_category {
-        // Library import: skip Gemini, use the known Zotero collection name.
-        Some(Ok(cat))
-    } else {
-        // Unclassified import: classify with hints from existing categories
-        // so the model prefers established names over inventing new ones.
-        let existing = list_existing_categories(&content_root);
-        let (extracted_title, abstract_text) = extract_title_and_abstract(&markdown);
-        let classify_title = if extracted_title.is_empty() { title.clone() } else { extracted_title };
-        let body_excerpt: String = markdown.chars().take(2_000).collect();
-
-        let category_result = if existing.is_empty() {
-            crate::gemini::classify_paper(classify_title, abstract_text, body_excerpt).await
-        } else {
-            crate::gemini::classify_paper_with_existing_categories(
-                classify_title,
-                abstract_text,
-                body_excerpt,
-                existing,
-            )
-            .await
-        };
-
-        Some(category_result)
-    };
+    // For library imports the Zotero collection name is already known — pass
+    // it directly so `process_paper_core` skips the Gemini classification call.
+    //
+    // For unclassified items pass `None` and let `process_paper_core` call
+    // Gemini internally (after the file is written to disk).  This keeps the
+    // total Gemini call count at two per item — one for PDF→markdown and one
+    // for classification — avoiding 429 rate-limit errors from a back-to-back
+    // third call that the previous implementation introduced.
+    let gemini_override: Option<Result<String, String>> = override_category.map(Ok);
 
     // ── Write to unclassified/<slug>.md ───────────────────────────────────
     let unclassified_dir = PathBuf::from(&content_root)

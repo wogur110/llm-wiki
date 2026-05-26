@@ -39,7 +39,7 @@ type ImportState =
   | { kind: 'idle' }
   | { kind: 'scanning'; source: ImportSource }
   | { kind: 'running';  source: ImportSource; done: number; total: number; current: string }
-  | { kind: 'finished'; source: ImportSource; success: number; failed: number; total: number }
+  | { kind: 'finished'; source: ImportSource; success: number; failed: number; total: number; lastError?: string }
   | { kind: 'error';    source: ImportSource; message: string }
 
 type SyncState =
@@ -243,6 +243,7 @@ export default function DashboardPage() {
 
     let success = 0
     let failed  = 0
+    let lastError: string | undefined
     for (let i = 0; i < items.length; i++) {
       const item = items[i]
       setImportState({
@@ -262,12 +263,15 @@ export default function DashboardPage() {
           overrideCategory: item.collection_name ?? null,
         })
         success++
-      } catch {
+      } catch (e) {
+        const msg = String(e)
+        console.error(`[import] "${item.title}" 실패:`, msg)
+        lastError = msg
         failed++
       }
     }
 
-    setImportState({ kind: 'finished', source, success, failed, total: items.length })
+    setImportState({ kind: 'finished', source, success, failed, total: items.length, lastError })
     await refresh()
   }
 
@@ -323,6 +327,16 @@ export default function DashboardPage() {
       {importState.kind === 'error' && (
         <div className="rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-950/40 px-4 py-3 text-sm text-red-700 dark:text-red-300">
           {importState.source === 'library' ? '기존 Zotero 불러오기' : 'PDF 가져오기'} 실패: {importState.message}
+        </div>
+      )}
+
+      {importState.kind === 'finished' && importState.failed > 0 && importState.lastError && (
+        <div className="rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/40 px-4 py-3 text-sm text-amber-800 dark:text-amber-200">
+          <span className="font-semibold">
+            {importState.source === 'library' ? '기존 Zotero 불러오기' : 'PDF 가져오기'}
+            {' '}— {importState.failed}/{importState.total}개 실패.
+          </span>{' '}
+          마지막 오류: {importState.lastError}
         </div>
       )}
 
@@ -680,11 +694,15 @@ function ImportPdfsButton({
       state.total === 0
         ? '새 PDF 없음'
         : `${ok ? '✓' : '!'} ${state.success}/${state.total}`
+    // Surface the last error as a hover tooltip so the user can see why it failed.
+    const buttonTitle = !ok && state.lastError
+      ? `실패 원인: ${state.lastError}`
+      : tooltip
     return (
       <button
         type="button"
         onClick={onClick}
-        title={tooltip}
+        title={buttonTitle}
         className={`rounded-lg px-3 py-1.5 text-xs font-medium text-white transition-colors ${
           ok ? 'bg-green-600 hover:bg-green-700' : 'bg-amber-600 hover:bg-amber-700'
         }`}
