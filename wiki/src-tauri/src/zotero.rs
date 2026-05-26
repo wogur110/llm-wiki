@@ -763,18 +763,56 @@ async fn resolve_pdf_entries(
     out
 }
 
-/// Ensure folder structure in `content/papers/` matches Zotero collections and
-/// vice versa.
+/// Recursively gather every category path under `papers_dir`, encoded as a
+/// `/`-separated string relative to `papers_dir`.
 ///
-/// The sync is bidirectional:
-/// * For each Zotero collection (excluding `Unclassified`) that has no matching
-///   folder under `content/papers/`, the folder is created.
-/// * For each folder under `content/papers/` (excluding `unclassified` and
-///   `.staging`) that has no matching Zotero collection, a Zotero collection
-///   is created.
+/// Skips hidden directories (`.staging`, `.git`, …) and the top-level
+/// `unclassified` folder.  Returns an empty set when the directory does not
+/// exist so callers can call this unconditionally.
+pub(crate) fn collect_wiki_paths(papers_dir: &Path) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    if !papers_dir.is_dir() {
+        return out;
+    }
+    for entry in walkdir::WalkDir::new(papers_dir)
+        .min_depth(1)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        if !entry.file_type().is_dir() {
+            continue;
+        }
+        let rel = match entry.path().strip_prefix(papers_dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let s = rel.to_string_lossy().replace('\\', "/");
+        if s.is_empty() {
+            continue;
+        }
+        let top = s.split('/').next().unwrap_or(&s);
+        if top.starts_with('.') || top.eq_ignore_ascii_case("unclassified") {
+            continue;
+        }
+        out.insert(s);
+    }
+    out
+}
+
+/// Mirror Zotero's collection hierarchy into `content/papers/`.
 ///
-/// The operation is best-effort — failures are collected and returned rather
-/// than aborting the whole sync.
+/// Walks the **full nested path** of every Zotero collection (e.g.
+/// `"Computer Vision/01_Generative_Models/Autoencoders"`) and creates the
+/// matching nested folder when it is missing from the wiki.
+///
+/// One-way only: pushing wiki folders back into Zotero is intentionally
+/// skipped because creating nested Zotero collections requires the parent
+/// collection's key and a separate write per level — the previous best-effort
+/// flat POST produced spurious "오류 N" reports for items that actually
+/// existed.  Zotero is treated as the source of truth here.
+///
+/// Best-effort — per-folder I/O failures are collected and reported but do
+/// not abort the run.
 #[tauri::command]
 pub async fn sync_zotero_structure(content_root: String) -> Result<SyncStructureResult, String> {
     let client = build_client();
@@ -784,72 +822,62 @@ pub async fn sync_zotero_structure(content_root: String) -> Result<SyncStructure
         errors: vec![],
     };
 
-    // ── Fetch Zotero collections ──────────────────────────────────────────
-    let collections_resp: serde_json::Value = client
-        .get(format!("{ZOTERO_API}/collections"))
-        .send()
-        .await
-        .map_err(|e| format!("Zotero unreachable: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("Zotero API error: {e}"))?
-        .json()
-        .await
-        .map_err(|e| format!("JSON decode error: {e}"))?;
-
-    // Build set of Zotero collection names (lower-case, excluding Unclassified).
-    let mut zotero_names: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    if let Some(arr) = collections_resp.as_array() {
-        for col in arr {
-            if let Some(name) = col["data"]["name"].as_str() {
-                let lname = name.to_lowercase();
-                if lname != "unclassified" {
-                    zotero_names.insert(lname);
-                }
-            }
-        }
+    // ── Build Zotero nested-path set (lowercase-Unclassified excluded) ────
+    let paths_map = fetch_collection_paths_map(&client).await;
+    if paths_map.is_empty() {
+        return Err(
+            "Zotero에서 컬렉션 목록을 가져올 수 없습니다. Zotero가 실행 중인지, \
+             그리고 \"Allow other applications…\" 설정이 켜져 있는지 확인하세요."
+                .into(),
+        );
     }
+    let zotero_paths: std::collections::HashSet<String> = paths_map
+        .values()
+        .filter(|p| {
+            // Drop a path whose *top-level* segment is "Unclassified" — those
+            // items belong to the Gemini-classification flow, not a literal
+            // folder.  Nested paths that *contain* the word are preserved.
+            let top = p.split('/').next().unwrap_or(p.as_str());
+            !top.eq_ignore_ascii_case("unclassified")
+        })
+        .cloned()
+        .collect();
 
-    // ── Scan wiki category folders ────────────────────────────────────────
+    // ── Walk the wiki folder tree recursively ─────────────────────────────
     let papers_dir = std::path::PathBuf::from(&content_root).join("papers");
-    let mut wiki_folders: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    if papers_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&papers_dir) {
-            for entry in entries.filter_map(Result::ok) {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                if is_dir && !name.starts_with('.') && name != "unclassified" {
-                    wiki_folders.insert(name);
-                }
-            }
+    let wiki_paths = collect_wiki_paths(&papers_dir);
+
+    // ── Zotero → wiki: create missing nested folders ──────────────────────
+    let mut to_create: Vec<&String> = zotero_paths
+        .iter()
+        .filter(|p| !wiki_paths.contains(*p))
+        .collect();
+    // Shorter paths first so a parent exists before any grandchild attempts
+    // to populate it (`create_dir_all` makes this redundant for correctness,
+    // but it keeps the reporting order intuitive).
+    to_create.sort_by_key(|p| (p.matches('/').count(), p.to_string()));
+
+    for path in to_create {
+        let dir = papers_dir.join(path);
+        match std::fs::create_dir_all(&dir) {
+            Ok(()) => result.folders_created.push(path.clone()),
+            Err(e) => result
+                .errors
+                .push(format!("Cannot create folder \"{path}\": {e}")),
         }
     }
 
-    // ── Zotero collection → wiki folder ───────────────────────────────────
-    for col_name in &zotero_names {
-        if !wiki_folders.contains(col_name) {
-            let dir = papers_dir.join(col_name);
-            match std::fs::create_dir_all(&dir) {
-                Ok(()) => result.folders_created.push(col_name.clone()),
-                Err(e) => result
-                    .errors
-                    .push(format!("Cannot create folder \"{col_name}\": {e}")),
-            }
-        }
-    }
-
-    // ── Wiki folder → Zotero collection ───────────────────────────────────
-    for folder in &wiki_folders {
-        if !zotero_names.contains(folder) {
-            match ensure_collection(&client, folder).await {
-                Ok(_) => result.collections_created.push(folder.clone()),
-                Err(e) => result
-                    .errors
-                    .push(format!("Cannot create collection \"{folder}\": {e}")),
-            }
-        }
-    }
+    // ── Wiki → Zotero: intentionally skipped ──────────────────────────────
+    //
+    // The previous bidirectional branch POSTed every top-level wiki folder to
+    // `/collections` whenever a case-insensitive name lookup missed.  For
+    // nested layouts (e.g. `Computer Vision/01_Generative_Models/Autoencoders`)
+    // that produced "오류 N" reports because:
+    //   - the local API rejects writes when the user has not allowed them,
+    //   - and even when allowed, a flat POST cannot recreate a nested
+    //     Zotero hierarchy without the parent collection's key.
+    // Zotero is the source of truth for the hierarchy; we mirror it into
+    // the wiki, not the other way around.
 
     Ok(result)
 }
@@ -1059,6 +1087,44 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("collection"));
+    }
+
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn collect_wiki_paths_includes_nested_dirs() {
+        let dir = TempDir::new().unwrap();
+        let papers = dir.path().join("papers");
+        let deep = papers
+            .join("Computer Vision")
+            .join("01_Generative_Models")
+            .join("Autoencoders");
+        fs::create_dir_all(&deep).unwrap();
+        fs::create_dir_all(papers.join("NLP")).unwrap();
+        fs::create_dir_all(papers.join("unclassified")).unwrap();
+        fs::create_dir_all(papers.join(".staging")).unwrap();
+
+        let paths = collect_wiki_paths(&papers);
+        assert!(paths.contains("Computer Vision"));
+        assert!(paths.contains("Computer Vision/01_Generative_Models"));
+        assert!(paths.contains("Computer Vision/01_Generative_Models/Autoencoders"));
+        assert!(paths.contains("NLP"));
+        assert!(
+            !paths.iter().any(|p| p.starts_with("unclassified")),
+            "unclassified top-level must be excluded"
+        );
+        assert!(
+            !paths.iter().any(|p| p.starts_with(".staging")),
+            "hidden folders must be excluded"
+        );
+    }
+
+    #[test]
+    fn collect_wiki_paths_handles_missing_directory() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        assert!(collect_wiki_paths(&missing).is_empty());
     }
 
     /// Flat collections (no parents) map to their own leaf name.
