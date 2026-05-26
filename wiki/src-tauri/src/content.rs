@@ -417,6 +417,15 @@ mod tests {
     }
 
     #[test]
+    fn mtime_iso_returns_rfc3339_for_existing_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("paper.md");
+        fs::write(&path, "body").unwrap();
+        let iso = mtime_iso(&path).expect("mtime");
+        assert!(iso.contains('T'));
+    }
+
+    #[test]
     fn is_user_category_excludes_system_folders() {
         assert!(is_user_category("large-language-models"));
         assert!(!is_user_category("unclassified"));

@@ -139,6 +139,18 @@ mod tests {
         let _ = delete_api_key();
     }
 
+    /// `has_api_key` must return `false` when the slot is empty or unreachable.
+    #[test]
+    fn test_has_api_key_false_when_missing_or_unavailable() {
+        let _g = KC_LOCK.lock().unwrap();
+        if keychain_unavailable() {
+            assert!(!has_api_key());
+            return;
+        }
+        let _ = delete_api_key();
+        assert!(!has_api_key());
+    }
+
     /// `get_api_key` must return `Err` when no key has been stored.
     #[test]
     fn test_get_nonexistent_key() {

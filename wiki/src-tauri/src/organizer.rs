@@ -569,39 +569,14 @@ where
     // ──────────────────────────────────────────────────────────────────────────
     emit_fn("ZoteroCollectionChanged", "started", None);
 
-    let lookup_result: Option<(crate::zotero::ZoteroItem, String)> = if let Some(zk) =
-        fm.zotero_key.as_ref()
-    {
-        // Hydrate the full item record so step 4 can also record the previous
-        // collection for rollback.  Falls through to DOI / title on failure
-        // (the user may have deleted the item from Zotero between import and
-        // organise).
-        match crate::zotero::get_item_by_key(zk.clone()).await {
-            Ok(i) => Some((i, format!("zotero_key {zk}"))),
-            Err(_) => None,
-        }
-    } else {
-        None
-    };
-
-    let lookup_result = match lookup_result {
-        Some(ok) => Some(ok),
-        None => match &fm.doi {
-            Some(d) => match crate::zotero::get_item_by_doi(d.clone()).await {
-                Ok(i) => Some((i, format!("DOI {d}"))),
-                Err(_) if !fm.title.is_empty() => crate::zotero::get_item_by_title(fm.title.clone())
-                    .await
-                    .ok()
-                    .map(|i| (i, format!("title fallback (DOI {d} not found)"))),
-                Err(_) => None,
-            },
-            None if !fm.title.is_empty() => crate::zotero::get_item_by_title(fm.title.clone())
-                .await
-                .ok()
-                .map(|i| (i, "title (no DOI in frontmatter)".to_string())),
-            None => None,
+    let lookup_result = crate::zotero::lookup_item_for_organizer(
+        &crate::zotero::OrganizerPaperHints {
+            zotero_key: fm.zotero_key.clone(),
+            doi: fm.doi.clone(),
+            title: fm.title.clone(),
         },
-    };
+    )
+    .await;
 
     let Some((item, lookup_via)) = lookup_result else {
         emit_fn(
@@ -919,5 +894,62 @@ mod tests {
         format!(
             "---\ntitle: Attention Is All You Need\nabstract: We propose a new architecture.\ndoi: {doi}\n---\n\nBody"
         )
+    }
+
+    #[test]
+    fn organizer_config_path_helpers() {
+        let dir = TempDir::new().unwrap();
+        let content = dir.path().join("content");
+        std::fs::create_dir_all(&content).unwrap();
+        let cfg = OrganizerConfig::new(content.clone());
+
+        assert!(cfg.unclassified_dir().ends_with("unclassified"));
+        assert!(cfg.staging_dir().ends_with(".staging"));
+        assert_eq!(
+            cfg.category_dir("nlp"),
+            content.join("papers").join("nlp")
+        );
+        assert!(cfg.log_path().to_string_lossy().contains("organize-"));
+        assert_eq!(
+            cfg.queue_path(),
+            content.join("meta").join("pending-zotero-sync.json")
+        );
+        assert_eq!(
+            cfg.dois_path(),
+            content.join("meta").join(".processed-dois.json")
+        );
+    }
+
+    #[test]
+    fn parse_frontmatter_reads_uppercase_doi_field() {
+        let md = "---\ntitle: T\nDOI: 10.1/UPPER\nabstract: A.\n---\n";
+        let fm = parse_frontmatter(md);
+        assert_eq!(fm.doi.as_deref(), Some("10.1/UPPER"));
+    }
+
+    #[test]
+    fn parse_frontmatter_strips_quotes_from_zotero_key() {
+        let md = "---\ntitle: T\nabstract: A.\nzotero_key: \"KEY99\"\n---\n";
+        let fm = parse_frontmatter(md);
+        assert_eq!(fm.zotero_key.as_deref(), Some("KEY99"));
+    }
+
+    #[test]
+    fn update_file_frontmatter_leaves_body_without_frontmatter() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("plain.md");
+        std::fs::write(&path, "No frontmatter here.").unwrap();
+        update_file_frontmatter(&path, "nlp", "One sentence.").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, "No frontmatter here.");
+    }
+
+    #[test]
+    fn record_doi_processed_creates_meta_directory() {
+        let dir = TempDir::new().unwrap();
+        let dois = dir.path().join("meta").join(".processed-dois.json");
+        record_doi_processed(&dois, "10.9/new", "paper.md", "cv").unwrap();
+        assert!(dois.exists());
+        assert!(is_duplicate_doi(&dois, "10.9/new"));
     }
 }

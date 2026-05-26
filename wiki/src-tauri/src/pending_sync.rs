@@ -377,4 +377,49 @@ mod tests {
         enqueue(qp.clone(), "paper.md".into(), "CCCC0003".into(), "rl".into()).unwrap();
         assert!(has_pending(qp), "Queue with one item must report has_pending = true");
     }
+
+    /// Corrupt queue JSON must not crash `has_pending` — treat as empty.
+    #[test]
+    fn test_has_pending_false_for_invalid_json() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("pending-zotero-sync.json");
+        std::fs::write(&path, "not-json").unwrap();
+        let qp = path.to_string_lossy().into_owned();
+        assert!(!has_pending(qp));
+    }
+
+    /// `load_queue` surfaces JSON parse errors to the caller.
+    #[test]
+    fn test_load_queue_invalid_json_returns_err() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("pending-zotero-sync.json");
+        std::fs::write(&path, "{broken").unwrap();
+        let qp = path.to_string_lossy().into_owned();
+        assert!(load_queue(qp).is_err());
+    }
+
+    /// Removing a key that is not in the queue is a no-op.
+    #[test]
+    fn test_remove_from_queue_missing_key_is_noop() {
+        let dir = tempdir().unwrap();
+        let qp = queue_path(&dir);
+        enqueue(qp.clone(), "paper.md".into(), "KEY1".into(), "nlp".into()).unwrap();
+        remove_from_queue(qp.clone(), "MISSING".into()).unwrap();
+        assert_eq!(load_queue(qp).unwrap().len(), 1);
+    }
+
+    /// `enqueue` creates nested parent directories for the queue file.
+    #[test]
+    fn test_enqueue_creates_nested_parent_dirs() {
+        let dir = tempdir().unwrap();
+        let qp = dir
+            .path()
+            .join("deep")
+            .join("meta")
+            .join("pending-zotero-sync.json")
+            .to_string_lossy()
+            .into_owned();
+        enqueue(qp.clone(), "p.md".into(), "ZZZZ9999".into(), "rl".into()).unwrap();
+        assert!(load_queue(qp).unwrap().len() == 1);
+    }
 }

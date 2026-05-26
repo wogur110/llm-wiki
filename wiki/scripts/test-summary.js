@@ -43,9 +43,13 @@ const WIKI_ROOT = resolve(__dirname, '..')   //   .../wiki
 const REPO_ROOT = resolve(WIKI_ROOT, '..')   //   .../llm-wiki
 
 const COVERAGE_THRESHOLD = 70
-/** Rust gate uses only testable business-logic modules (excludes lib/main/gemini HTTP). */
+/**
+ * Rust gate uses only testable business-logic modules.
+ * Excludes lib/main/gemini HTTP and pending_sync (sync_all needs a live
+ * Tauri window + Zotero — covered by integration/manual runs, not unit tests).
+ */
 const RUST_CORE_MODULE_RE =
-  /src-tauri\/src\/(content|organizer|transaction|pending_sync|keychain)\.rs$/
+  /src-tauri\/src\/(content|organizer|transaction|keychain)\.rs$/
 const FRONTEND_COVERAGE_JSON = join(
   WIKI_ROOT,
   'coverage',
@@ -274,7 +278,7 @@ if (feCov) {
 if (ruCov) {
   const coreOk = ruCov.coreLines >= COVERAGE_THRESHOLD
   console.log(
-    `  ${coreOk ? green('✓') : red('✗')} Rust (core)  ${ruCov.coreLines.toFixed(1).padStart(5)}%  ${bar(ruCov.coreLines)}  ${dim('(content/organizer/tx/pending/keychain)')}`,
+    `  ${coreOk ? green('✓') : red('✗')} Rust (core)  ${ruCov.coreLines.toFixed(1).padStart(5)}%  ${bar(ruCov.coreLines)}  ${dim('(content/organizer/tx/keychain)')}`,
   )
   console.log(
     `  ${dim('○')} Rust (all)   ${ruCov.lines.toFixed(1).padStart(5)}%  ${bar(ruCov.lines)}  ${dim('(includes lib/gemini/main)')}`,

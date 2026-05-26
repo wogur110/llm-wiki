@@ -274,6 +274,49 @@ pub async fn get_item_by_doi(doi: String) -> Result<ZoteroItem, String> {
         .ok_or_else(|| format!("No Zotero item found for DOI: {doi}"))
 }
 
+/// Metadata the organiser uses to locate a Zotero item (step 4).
+pub(crate) struct OrganizerPaperHints {
+    pub zotero_key: Option<String>,
+    pub doi: Option<String>,
+    pub title: String,
+}
+
+/// Resolve a Zotero library item for the organiser pipeline.
+///
+/// Lookup order:
+///   1. `zotero_key` (injected by the Zotero-driven PDF importer)
+///   2. DOI
+///   3. title (also used as a fallback when DOI lookup fails)
+///
+/// Returns `None` when every attempt fails or Zotero is unreachable.
+pub(crate) async fn lookup_item_for_organizer(
+    hints: &OrganizerPaperHints,
+) -> Option<(ZoteroItem, String)> {
+    if let Some(zk) = hints.zotero_key.as_ref().filter(|k| !k.is_empty()) {
+        if let Ok(item) = get_item_by_key(zk.clone()).await {
+            return Some((item, format!("zotero_key {zk}")));
+        }
+    }
+
+    if let Some(doi) = hints.doi.as_ref().filter(|d| !d.is_empty()) {
+        match get_item_by_doi(doi.clone()).await {
+            Ok(item) => return Some((item, format!("DOI {doi}"))),
+            Err(_) if !hints.title.is_empty() => {
+                if let Ok(item) = get_item_by_title(hints.title.clone()).await {
+                    return Some((item, format!("title fallback (DOI {doi} not found)")));
+                }
+            }
+            _ => {}
+        }
+    } else if !hints.title.is_empty() {
+        if let Ok(item) = get_item_by_title(hints.title.clone()).await {
+            return Some((item, "title (no DOI in frontmatter)".to_string()));
+        }
+    }
+
+    None
+}
+
 /// Look up a Zotero library item by its primary key.
 ///
 /// Used by the Zotero-driven PDF importer so the organiser pipeline can keep
