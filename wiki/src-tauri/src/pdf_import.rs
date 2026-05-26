@@ -38,6 +38,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use tauri::Emitter;
 use walkdir::WalkDir;
 
 /// Default name of the Zotero collection scanned by `list_zotero_unclassified`.
@@ -267,6 +268,12 @@ pub struct ZoteroPdfImportEntry {
     pub attachment_key: String,
     pub title: String,
     pub slug: String,
+    /// The Zotero collection this item belongs to (lower-case kebab-case),
+    /// or `None` if the item is in the Unclassified collection or has no
+    /// collection.  When `Some`, the importer uses this as the classification
+    /// override (skipping Gemini) to preserve the existing Zotero folder
+    /// structure during a full-library import.
+    pub collection_name: Option<String>,
 }
 
 /// Inject `zotero_key: <key>` into the YAML frontmatter so the organiser can
@@ -361,17 +368,81 @@ fn dedup_zotero_entries(
             if slug.is_empty() || existing.contains(&slug) {
                 return None;
             }
+
+            // Filter out the Unclassified collection name — items from it
+            // should be classified by Gemini, not placed in an "unclassified"
+            // category folder.
+            let collection_name = entry.collection_name.and_then(|name| {
+                if name.to_lowercase() == "unclassified" {
+                    None
+                } else {
+                    Some(name)
+                }
+            });
+
             Some(ZoteroPdfImportEntry {
                 item_key: entry.item_key,
                 attachment_key: entry.attachment_key,
                 title: entry.title,
                 slug,
+                collection_name,
             })
         })
         .collect();
 
     out.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
     out
+}
+
+/// List the category folder names currently under `content/papers/`.
+///
+/// Excludes hidden directories (`.staging`) and the `unclassified` folder.
+/// Returns an empty `Vec` if `papers/` does not exist.
+fn list_existing_categories(content_root: &str) -> Vec<String> {
+    let papers_dir = PathBuf::from(content_root).join("papers");
+    if !papers_dir.is_dir() {
+        return vec![];
+    }
+    let mut cats = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&papers_dir) {
+        for entry in entries.filter_map(Result::ok) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if is_dir && !name.starts_with('.') && name != "unclassified" {
+                cats.push(name);
+            }
+        }
+    }
+    cats.sort();
+    cats
+}
+
+/// Extract `title` and `abstract` values from a markdown document's YAML
+/// frontmatter (the `---` block at the top).
+///
+/// Returns empty strings for any field that cannot be found.
+fn extract_title_and_abstract(markdown: &str) -> (String, String) {
+    let mut title = String::new();
+    let mut abstract_text = String::new();
+
+    if !markdown.starts_with("---") {
+        return (title, abstract_text);
+    }
+
+    let after_open = markdown.trim_start_matches("---\n");
+    let end = after_open.find("\n---").unwrap_or(after_open.len());
+    let yaml = &after_open[..end];
+
+    for line in yaml.lines() {
+        let t = line.trim();
+        if let Some(v) = t.strip_prefix("title:") {
+            title = v.trim().trim_matches('"').trim_matches('\'').to_string();
+        } else if let Some(v) = t.strip_prefix("abstract:") {
+            abstract_text = v.trim().trim_matches('"').trim_matches('\'').to_string();
+        }
+    }
+
+    (title, abstract_text)
 }
 
 /// Import a single Zotero item: download its PDF attachment, convert to
@@ -384,11 +455,20 @@ fn dedup_zotero_entries(
 /// organiser is run with [`PdfMoveSpec::None`] because ZotMoov receives the
 /// authoritative signal via Zotero's collection field; LLM-Wiki does not need
 /// to verify the physical move.
+///
+/// # Category resolution
+/// * `override_category = Some(cat)` — used by the "import existing library"
+///   flow where the paper's Zotero collection is already known.  The Gemini
+///   classification call is skipped entirely and `cat` is used directly.
+/// * `override_category = None` — used by the "import unclassified" flow.
+///   Existing wiki categories are listed and passed to Gemini as hints so the
+///   model prefers them over inventing new names.
 #[tauri::command]
 pub async fn import_zotero_item_and_organize(
     item_key: String,
     attachment_key: String,
     content_root: String,
+    override_category: Option<String>,
     window: tauri::WebviewWindow,
 ) -> Result<crate::organizer::ProcessResult, String> {
     // ── Download the PDF bytes through the local API ──────────────────────
@@ -411,6 +491,37 @@ pub async fn import_zotero_item_and_organize(
         slug
     };
 
+    // ── Determine category before writing to disk ─────────────────────────
+    //
+    // We pre-determine the category here (one Gemini call total) and pass it
+    // to `process_paper_core` as a `gemini_override` so the core pipeline
+    // does not issue a second classification call.
+    let gemini_override: Option<Result<String, String>> = if let Some(cat) = override_category {
+        // Library import: skip Gemini, use the known Zotero collection name.
+        Some(Ok(cat))
+    } else {
+        // Unclassified import: classify with hints from existing categories
+        // so the model prefers established names over inventing new ones.
+        let existing = list_existing_categories(&content_root);
+        let (extracted_title, abstract_text) = extract_title_and_abstract(&markdown);
+        let classify_title = if extracted_title.is_empty() { title.clone() } else { extracted_title };
+        let body_excerpt: String = markdown.chars().take(2_000).collect();
+
+        let category_result = if existing.is_empty() {
+            crate::gemini::classify_paper(classify_title, abstract_text, body_excerpt).await
+        } else {
+            crate::gemini::classify_paper_with_existing_categories(
+                classify_title,
+                abstract_text,
+                body_excerpt,
+                existing,
+            )
+            .await
+        };
+
+        Some(category_result)
+    };
+
     // ── Write to unclassified/<slug>.md ───────────────────────────────────
     let unclassified_dir = PathBuf::from(&content_root)
         .join("papers")
@@ -426,12 +537,24 @@ pub async fn import_zotero_item_and_organize(
     // ── Hand off to the organiser pipeline ────────────────────────────────
     // pdf_root / pdf_filename are intentionally None — ZotMoov is driven by
     // the Zotero collection change (step 4) and we trust it to move the file.
-    crate::organizer::process_paper(
+    let window_clone = window.clone();
+    let emit_fn = move |step: &str, status: &str, detail: Option<&str>| {
+        let _ = window_clone.emit(
+            "tx-progress",
+            serde_json::json!({
+                "step": step,
+                "status": status,
+                "detail": detail,
+            }),
+        );
+    };
+
+    crate::organizer::process_paper_core(
         md_path.to_string_lossy().into_owned(),
         content_root,
-        None,
-        None,
-        window,
+        crate::organizer::PdfMoveSpec::None,
+        emit_fn,
+        gemini_override,
     )
     .await
 }

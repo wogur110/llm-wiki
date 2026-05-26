@@ -517,6 +517,10 @@ where
         eprintln!("Warning: frontmatter update skipped: {e}");
     }
 
+    // After step 3 the file lives at target_path, not the original paper_str.
+    // Use this for log entries and the DOI registry so the stored path is valid.
+    let target_str = target_path.to_string_lossy().into_owned();
+
     // ──────────────────────────────────────────────────────────────────────────
     // OFFLINE BRANCH  Zotero unreachable → enqueue steps 4-5 and return
     // ──────────────────────────────────────────────────────────────────────────
@@ -544,9 +548,9 @@ where
 
         // Record DOI and log success for this completed-to-step-3 run.
         if let Some(ref doi) = fm.doi {
-            let _ = record_doi_processed(&config.dois_path(), doi, &paper_str, &category);
+            let _ = record_doi_processed(&config.dois_path(), doi, &target_str, &category);
         }
-        log_success(&config, &paper_str, &category);
+        log_success(&config, &target_str, &category);
 
         return Ok(ProcessResult {
             category,
@@ -585,7 +589,7 @@ where
             Some("no Zotero item matched DOI or title"),
         );
         emit_fn("ZotMovConfirmed", "skipped", Some("no Zotero item resolved"));
-        log_success(&config, &paper_str, &category);
+        log_success(&config, &target_str, &category);
         return Ok(ProcessResult {
             category,
             final_path: target_path.to_string_lossy().into_owned(),
@@ -680,9 +684,9 @@ where
 
     // Record DOI + log success for fully completed pipeline.
     if let Some(ref doi) = fm.doi {
-        let _ = record_doi_processed(&config.dois_path(), doi, &paper_str, &category);
+        let _ = record_doi_processed(&config.dois_path(), doi, &target_str, &category);
     }
-    log_success(&config, &paper_str, &category);
+    log_success(&config, &target_str, &category);
 
     Ok(ProcessResult {
         category,

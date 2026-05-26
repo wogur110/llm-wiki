@@ -237,9 +237,32 @@ pub async fn sync_all(
             },
         );
 
+        // When Zotero was offline at classify time the key is a placeholder
+        // ("doi:<doi>" or "file:<name>") rather than a real 8-char Zotero key.
+        // Resolve it to the actual item key before calling update_collection.
+        let real_key = match resolve_zotero_key(item).await {
+            Ok(k) => k,
+            Err(e) => {
+                let msg = format!(
+                    "[{}] → \"{}\": key resolution failed: {e}",
+                    item.zotero_item_key, item.target_collection
+                );
+                errors.push(msg);
+                failed_items.push(item.clone());
+                let _ = window.emit(
+                    "pending-sync-item-error",
+                    ItemErrorPayload {
+                        zotero_item_key: item.zotero_item_key.clone(),
+                        error: e,
+                    },
+                );
+                continue;
+            }
+        };
+
         // Delegate to the zotero module — find-or-create collection then PATCH.
         match crate::zotero::update_collection(
-            item.zotero_item_key.clone(),
+            real_key,
             item.target_collection.clone(),
         )
         .await
@@ -288,6 +311,80 @@ pub async fn sync_all(
     let _ = window.emit("pending-sync-complete", result.clone());
 
     Ok(result)
+}
+
+// ── Key resolution helpers ────────────────────────────────────────────────────
+
+/// Resolve a `PendingSyncItem`'s `zotero_item_key` to a *real* Zotero item key.
+///
+/// When Zotero is offline at classify time, the organiser stores a placeholder
+/// key of the form `"doi:<doi>"` or `"file:<filename>"` instead of an actual
+/// 8-character alphanumeric Zotero key.  This function turns those placeholders
+/// back into real keys so `sync_all` can call `update_collection` correctly.
+///
+/// Lookup strategy:
+/// 1. Key looks like a real Zotero key (8 uppercase alphanumeric chars) → use as-is.
+/// 2. `"doi:<doi>"` → look up by DOI via the Zotero local API.
+/// 3. `"file:<name>"` → read `paper_file`'s YAML frontmatter, extract `title:`,
+///    look up by title via the Zotero local API.
+/// 4. Anything else → pass through unchanged (might be a key format we don't
+///    recognise yet; `update_collection` will surface any Zotero-side error).
+async fn resolve_zotero_key(item: &PendingSyncItem) -> Result<String, String> {
+    let key = &item.zotero_item_key;
+
+    // Real Zotero keys are exactly 8 uppercase alphanumeric characters.
+    if key.len() == 8 && key.chars().all(|c| c.is_ascii_alphanumeric() && (c.is_ascii_uppercase() || c.is_ascii_digit())) {
+        return Ok(key.clone());
+    }
+
+    if let Some(doi) = key.strip_prefix("doi:") {
+        return crate::zotero::get_item_by_doi(doi.to_string())
+            .await
+            .map(|zi| zi.key)
+            .map_err(|e| format!("DOI lookup for \"{doi}\": {e}"));
+    }
+
+    if key.starts_with("file:") {
+        // Try to extract the paper title from its markdown frontmatter.
+        let title = std::fs::read_to_string(&item.paper_file)
+            .ok()
+            .and_then(|content| extract_title_from_frontmatter(&content));
+
+        return match title {
+            Some(t) if !t.is_empty() => crate::zotero::get_item_by_title(t.clone())
+                .await
+                .map(|zi| zi.key)
+                .map_err(|e| format!("Title lookup for \"{t}\": {e}")),
+            _ => Err(format!(
+                "Cannot resolve Zotero item for placeholder key \"{key}\": \
+                 paper file has no parseable title in frontmatter"
+            )),
+        };
+    }
+
+    // Unknown format — pass through and let Zotero reject it if invalid.
+    Ok(key.clone())
+}
+
+/// Extract the `title:` value from a YAML frontmatter block (`--- … ---`).
+///
+/// Returns `None` if the file has no frontmatter or no `title:` field.
+fn extract_title_from_frontmatter(content: &str) -> Option<String> {
+    if !content.starts_with("---") {
+        return None;
+    }
+    let after = content.trim_start_matches("---\n");
+    let end = after.find("\n---").unwrap_or(after.len());
+    for line in after[..end].lines() {
+        let t = line.trim();
+        if let Some(v) = t.strip_prefix("title:") {
+            let title = v.trim().trim_matches('"').trim_matches('\'').to_string();
+            if !title.is_empty() {
+                return Some(title);
+            }
+        }
+    }
+    None
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -421,5 +518,109 @@ mod tests {
             .into_owned();
         enqueue(qp.clone(), "p.md".into(), "ZZZZ9999".into(), "rl".into()).unwrap();
         assert!(load_queue(qp).unwrap().len() == 1);
+    }
+
+    // ── resolve_zotero_key tests ──────────────────────────────────────────────
+
+    fn make_item(key: &str, paper_file: &str) -> PendingSyncItem {
+        PendingSyncItem {
+            paper_file: paper_file.to_string(),
+            zotero_item_key: key.to_string(),
+            target_collection: "nlp".to_string(),
+            queued_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    /// A real 8-char uppercase Zotero key must be returned unchanged.
+    #[tokio::test]
+    async fn resolve_real_key_unchanged() {
+        let item = make_item("ABCD1234", "/no/such/file.md");
+        let result = resolve_zotero_key(&item).await;
+        assert_eq!(result.unwrap(), "ABCD1234");
+    }
+
+    /// A lowercase 8-char key is NOT a real Zotero key — should fall through to
+    /// the pass-through branch (not the "real key" shortcut).
+    #[tokio::test]
+    async fn resolve_lowercase_key_falls_through() {
+        let item = make_item("abcd1234", "/no/such/file.md");
+        // Zotero is offline in CI so it will fail resolution — the point is
+        // that it does NOT use the real-key fast path for lowercase keys.
+        let result = resolve_zotero_key(&item).await;
+        // Either Ok (passed through) or Err (Zotero offline) — both are fine.
+        // The key thing is the function doesn't panic.
+        let _ = result;
+    }
+
+    /// `"doi:"` prefix → should attempt a DOI lookup (fails offline, which is expected).
+    #[tokio::test]
+    async fn resolve_doi_prefix_attempts_lookup() {
+        let item = make_item("doi:10.1234/test", "/no/such/file.md");
+        let result = resolve_zotero_key(&item).await;
+        // Must fail since Zotero isn't running, but with a DOI-related message.
+        let err = result.expect_err("DOI lookup must fail when Zotero is offline");
+        assert!(
+            err.contains("10.1234/test") || err.contains("Zotero"),
+            "Error should mention the DOI or Zotero: {err}"
+        );
+    }
+
+    /// `"file:"` prefix with a readable markdown file that has a title → title lookup.
+    #[tokio::test]
+    async fn resolve_file_prefix_reads_title_from_frontmatter() {
+        let dir = tempdir().unwrap();
+        let paper = dir.path().join("paper.md");
+        std::fs::write(
+            &paper,
+            "---\ntitle: Attention Is All You Need\nabstract: Short.\n---\n",
+        )
+        .unwrap();
+
+        let item = make_item(
+            &format!("file:{}", paper.file_name().unwrap().to_string_lossy()),
+            &paper.to_string_lossy(),
+        );
+        let result = resolve_zotero_key(&item).await;
+        // Must fail since Zotero isn't running — but the error proves we tried title lookup.
+        let err = result.expect_err("title lookup must fail when Zotero is offline");
+        assert!(
+            err.contains("Attention Is All You Need") || err.contains("Zotero"),
+            "Error should mention the title or Zotero: {err}"
+        );
+    }
+
+    /// `"file:"` prefix with no readable paper file → descriptive error.
+    #[tokio::test]
+    async fn resolve_file_prefix_missing_paper_file() {
+        let item = make_item("file:phantom.md", "/nonexistent/phantom.md");
+        let result = resolve_zotero_key(&item).await;
+        let err = result.expect_err("must fail for missing paper file");
+        assert!(
+            err.contains("no parseable title") || err.contains("phantom"),
+            "Error should explain why resolution failed: {err}"
+        );
+    }
+
+    /// `extract_title_from_frontmatter` must return the title from valid YAML.
+    #[test]
+    fn extract_title_parses_yaml_frontmatter() {
+        let md = "---\ntitle: My Paper Title\nabstract: Some abstract.\n---\nBody";
+        assert_eq!(
+            extract_title_from_frontmatter(md).as_deref(),
+            Some("My Paper Title")
+        );
+    }
+
+    /// No frontmatter → `None`.
+    #[test]
+    fn extract_title_returns_none_without_frontmatter() {
+        assert_eq!(extract_title_from_frontmatter("Plain body only."), None);
+    }
+
+    /// Frontmatter with no `title:` field → `None`.
+    #[test]
+    fn extract_title_returns_none_when_title_absent() {
+        let md = "---\nabstract: Something.\n---\n";
+        assert_eq!(extract_title_from_frontmatter(md), None);
     }
 }

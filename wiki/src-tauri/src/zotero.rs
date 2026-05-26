@@ -18,6 +18,7 @@
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 use tokio::time::{sleep, Duration, Instant};
 
@@ -92,6 +93,24 @@ pub struct ZoteroPdfEntry {
     /// Original filename of the PDF attachment, if Zotero exposes one.  Used
     /// when picking a markdown filename so wikilinks match the source paper.
     pub filename: Option<String>,
+    /// The Zotero collection name (lower-case kebab-case) this item belongs to,
+    /// or `None` if the item is in the Unclassified collection or has no
+    /// collection.  Consumed by the importer as a classification override so
+    /// Gemini is skipped for items with a known category.
+    pub collection_name: Option<String>,
+}
+
+/// Result returned by [`sync_zotero_structure`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SyncStructureResult {
+    /// Category folder names created under `content/papers/` (Zotero had the
+    /// collection but no folder existed in the wiki).
+    pub folders_created: Vec<String>,
+    /// Zotero collection names created because the wiki had the folder but
+    /// Zotero did not have the corresponding collection.
+    pub collections_created: Vec<String>,
+    /// Non-fatal errors encountered during the sync (sync continues past them).
+    pub errors: Vec<String>,
 }
 
 // ── Internal wire types ───────────────────────────────────────────────────────
@@ -217,6 +236,44 @@ pub(crate) async fn ensure_collection(
         .to_string();
 
     Ok(key)
+}
+
+/// Fetch all Zotero collections and return a `key → name` map.
+///
+/// Returns an empty map on any network or parse error so callers can
+/// degrade gracefully (items will have `collection_name = None`).
+pub(crate) async fn fetch_collections_map(client: &Client) -> HashMap<String, String> {
+    let resp: serde_json::Value = match client
+        .get(format!("{ZOTERO_API}/collections"))
+        .send()
+        .await
+        .and_then(|r| {
+            // We need an async `.json()` but we're in a sync context here —
+            // chain via the future produced by `.json()`.
+            Ok(r)
+        }) {
+        Ok(r) => match r.error_for_status() {
+            Ok(r) => match r.json::<serde_json::Value>().await {
+                Ok(v) => v,
+                Err(_) => return HashMap::new(),
+            },
+            Err(_) => return HashMap::new(),
+        },
+        Err(_) => return HashMap::new(),
+    };
+
+    let mut map = HashMap::new();
+    if let Some(arr) = resp.as_array() {
+        for col in arr {
+            if let (Some(key), Some(name)) = (
+                col["key"].as_str(),
+                col["data"]["name"].as_str(),
+            ) {
+                map.insert(key.to_string(), name.to_string());
+            }
+        }
+    }
+    map
 }
 
 // ── Tauri commands ────────────────────────────────────────────────────────────
@@ -535,17 +592,25 @@ pub async fn list_collection_pdf_items(
         .await
         .map_err(|e| format!("JSON decode error: {e}"))?;
 
-    Ok(resolve_pdf_entries(&client, top_items).await)
+    // All items from this endpoint belong to the queried collection.
+    // Passing the collection name as override so every entry gets it.
+    Ok(resolve_pdf_entries(&client, top_items, &HashMap::new(), Some(name)).await)
 }
 
 /// List every top-level item in the **entire** user library together with its
 /// first PDF attachment.  Used by the "import existing Zotero" flow that
 /// re-imports a library that pre-dates LLM-Wiki — no collection filter.
 ///
-/// Items without a PDF child are silently skipped.
+/// Items without a PDF child are silently skipped.  Each entry's
+/// `collection_name` is populated from Zotero's collection data so the
+/// importer can place items in the correct folder without a Gemini call.
 #[tauri::command]
 pub async fn list_all_pdf_items() -> Result<Vec<ZoteroPdfEntry>, String> {
     let client = build_client();
+
+    // Fetch all collections upfront so we can resolve each item's collection
+    // name in O(1) without extra HTTP requests per item.
+    let collections_map = fetch_collections_map(&client).await;
 
     let top_items: Vec<serde_json::Value> = client
         .get(format!("{ZOTERO_API}/items/top"))
@@ -562,14 +627,24 @@ pub async fn list_all_pdf_items() -> Result<Vec<ZoteroPdfEntry>, String> {
         .await
         .map_err(|e| format!("JSON decode error: {e}"))?;
 
-    Ok(resolve_pdf_entries(&client, top_items).await)
+    Ok(resolve_pdf_entries(&client, top_items, &collections_map, None).await)
 }
 
 /// Resolve a list of top-level item JSON blobs into [`ZoteroPdfEntry`] values.
 /// Items whose first attachment is not a PDF are dropped.  Sorted by title.
+///
+/// `collections_map` maps Zotero collection keys to their names — used to
+/// populate `ZoteroPdfEntry::collection_name` for each item.
+///
+/// When `override_collection_name` is `Some(name)`, that name is used for
+/// **all** items regardless of their own `data.collections` field.  This is
+/// the correct behaviour for [`list_collection_pdf_items`] where all returned
+/// items are definitively members of the queried collection.
 async fn resolve_pdf_entries(
     client: &Client,
     top_items: Vec<serde_json::Value>,
+    collections_map: &HashMap<String, String>,
+    override_collection_name: Option<&str>,
 ) -> Vec<ZoteroPdfEntry> {
     let mut out: Vec<ZoteroPdfEntry> = Vec::with_capacity(top_items.len());
 
@@ -582,18 +657,124 @@ async fn resolve_pdf_entries(
             .map(str::to_string)
             .unwrap_or_else(|| item_key.clone());
 
+        // Determine collection name: use override when provided (items from a
+        // specific collection endpoint), or look up the item's first collection
+        // key in the map (full-library listing).
+        let collection_name: Option<String> = override_collection_name
+            .map(|n| n.to_string())
+            .or_else(|| {
+                item["data"]["collections"]
+                    .as_array()
+                    .and_then(|arr| arr.first())
+                    .and_then(|v| v.as_str())
+                    .and_then(|k| collections_map.get(k))
+                    .cloned()
+            });
+
         if let Ok(Some(pdf)) = first_pdf_attachment(client, &item_key).await {
             out.push(ZoteroPdfEntry {
                 item_key,
                 attachment_key: pdf.0,
                 title,
                 filename: pdf.1,
+                collection_name,
             });
         }
     }
 
     out.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
     out
+}
+
+/// Ensure folder structure in `content/papers/` matches Zotero collections and
+/// vice versa.
+///
+/// The sync is bidirectional:
+/// * For each Zotero collection (excluding `Unclassified`) that has no matching
+///   folder under `content/papers/`, the folder is created.
+/// * For each folder under `content/papers/` (excluding `unclassified` and
+///   `.staging`) that has no matching Zotero collection, a Zotero collection
+///   is created.
+///
+/// The operation is best-effort — failures are collected and returned rather
+/// than aborting the whole sync.
+#[tauri::command]
+pub async fn sync_zotero_structure(content_root: String) -> Result<SyncStructureResult, String> {
+    let client = build_client();
+    let mut result = SyncStructureResult {
+        folders_created: vec![],
+        collections_created: vec![],
+        errors: vec![],
+    };
+
+    // ── Fetch Zotero collections ──────────────────────────────────────────
+    let collections_resp: serde_json::Value = client
+        .get(format!("{ZOTERO_API}/collections"))
+        .send()
+        .await
+        .map_err(|e| format!("Zotero unreachable: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("Zotero API error: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("JSON decode error: {e}"))?;
+
+    // Build set of Zotero collection names (lower-case, excluding Unclassified).
+    let mut zotero_names: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    if let Some(arr) = collections_resp.as_array() {
+        for col in arr {
+            if let Some(name) = col["data"]["name"].as_str() {
+                let lname = name.to_lowercase();
+                if lname != "unclassified" {
+                    zotero_names.insert(lname);
+                }
+            }
+        }
+    }
+
+    // ── Scan wiki category folders ────────────────────────────────────────
+    let papers_dir = std::path::PathBuf::from(&content_root).join("papers");
+    let mut wiki_folders: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    if papers_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&papers_dir) {
+            for entry in entries.filter_map(Result::ok) {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                if is_dir && !name.starts_with('.') && name != "unclassified" {
+                    wiki_folders.insert(name);
+                }
+            }
+        }
+    }
+
+    // ── Zotero collection → wiki folder ───────────────────────────────────
+    for col_name in &zotero_names {
+        if !wiki_folders.contains(col_name) {
+            let dir = papers_dir.join(col_name);
+            match std::fs::create_dir_all(&dir) {
+                Ok(()) => result.folders_created.push(col_name.clone()),
+                Err(e) => result
+                    .errors
+                    .push(format!("Cannot create folder \"{col_name}\": {e}")),
+            }
+        }
+    }
+
+    // ── Wiki folder → Zotero collection ───────────────────────────────────
+    for folder in &wiki_folders {
+        if !zotero_names.contains(folder) {
+            match ensure_collection(&client, folder).await {
+                Ok(_) => result.collections_created.push(folder.clone()),
+                Err(e) => result
+                    .errors
+                    .push(format!("Cannot create collection \"{folder}\": {e}")),
+            }
+        }
+    }
+
+    Ok(result)
 }
 
 /// Return `(attachment_key, filename)` for the item's first PDF attachment,

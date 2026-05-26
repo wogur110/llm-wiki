@@ -330,6 +330,93 @@ pub async fn call_gemini(messages: Vec<Message>, window: tauri::WebviewWindow) {
     let _ = window.emit("gemini-stream-done", ());
 }
 
+/// Classify a paper into an **existing** category when possible, creating a
+/// new one only if none of the candidates fit well.
+///
+/// Same interface as [`classify_paper`] but the prompt includes the list of
+/// existing categories so Gemini prefers them over inventing new names.
+/// Call this for new papers imported from the Zotero Unclassified collection
+/// when the wiki already has established categories.
+///
+/// `existing_categories` should be lower-case kebab-case names.  An empty
+/// slice falls back to free-form classification (same behaviour as
+/// [`classify_paper`]).
+///
+/// # Errors
+/// Same error conditions as [`classify_paper`].
+pub(crate) async fn classify_paper_with_existing_categories(
+    title: String,
+    abstract_text: String,
+    body: String,
+    existing_categories: Vec<String>,
+) -> Result<String, String> {
+    let api_key = crate::keychain::get_key_inner()
+        .map_err(|e| format!("No API key in keychain: {e}"))?;
+
+    let client = build_client();
+    let body_excerpt: String = body.chars().take(BODY_EXCERPT_CHARS).collect();
+
+    let category_hint = if existing_categories.is_empty() {
+        String::new()
+    } else {
+        let cats = existing_categories.join("\", \"");
+        format!(
+            "Prefer one of these existing categories if the paper fits well: \
+             [\"{cats}\"]\n\
+             Only create a NEW category if the paper genuinely does not fit \
+             any of the above (e.g., it covers a completely different field).\n\n"
+        )
+    };
+
+    let prompt = format!(
+        "Classify the following research paper into a single lower-case \
+         kebab-case category string (examples: \"large-language-models\", \
+         \"reinforcement-learning\", \"computer-vision\", \
+         \"multimodal-learning\", \"graph-neural-networks\"). \
+         Rules:\n\
+         - Return ONLY the category string.\n\
+         - No spaces, no punctuation, no explanation.\n\
+         - Use hyphens between words.\n\
+         - All lower-case.\n\n\
+         {category_hint}\
+         Title: {title}\n\n\
+         Abstract: {abstract_text}\n\n\
+         Body excerpt:\n{body_excerpt}"
+    );
+
+    let url = format!("{API_BASE}/{MODEL}:generateContent?key={api_key}");
+    let request_body = GeminiRequest {
+        contents: vec![GeminiContent {
+            role: "user".into(),
+            parts: vec![GeminiPart::text(prompt)],
+        }],
+    };
+
+    let resp: GeminiResponse = client
+        .post(&url)
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("Gemini API error: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("JSON decode error: {e}"))?;
+
+    let raw = extract_ns_text(&resp).unwrap_or_default();
+    let category = normalise_category(&raw);
+
+    if category.is_empty() {
+        return Err(format!(
+            "Gemini returned an empty category (raw: {:?})",
+            raw
+        ));
+    }
+
+    Ok(category)
+}
+
 /// Classify a research paper and return a lower-case kebab-case category string.
 ///
 /// The category is the *only* output — no explanation, no punctuation.

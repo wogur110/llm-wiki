@@ -1,12 +1,14 @@
 'use client'
 
 /**
- * SearchBar — fuzzy search across `wiki/public/search-index.json`.
+ * SearchBar — live fuzzy search over all papers in the wiki.
  *
- * Index format (see `scripts/build-search-index.js`):
- *   { title, tags, summary, category, slug, year }
+ * Data source: Tauri `list_recent_papers` command (all papers, not just
+ * recent ones).  Loaded once on mount; refreshes if the component re-mounts.
+ * Fallback to empty index if the content-root is not yet set (e.g. on
+ * /onboarding, which hides the Header anyway).
  *
- * Search fields are weighted via Fuse.js: title > tags > summary.
+ * Search fields are weighted via Fuse.js: title > authors > tags > summary.
  *
  * Triggers:
  *   * Click on the input
@@ -19,9 +21,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import Fuse, { type IFuseOptions } from 'fuse.js'
+import { listAllPapers, getContentRoot } from '@/lib/content'
 
 interface SearchEntry {
   title: string
+  authors: string[]
   tags: string[]
   summary: string
   category: string | null
@@ -35,9 +39,10 @@ const FUSE_OPTIONS: IFuseOptions<SearchEntry> = {
   ignoreLocation: true,
   minMatchCharLength: 2,
   keys: [
-    { name: 'title', weight: 0.6 },
-    { name: 'tags', weight: 0.25 },
-    { name: 'summary', weight: 0.15 },
+    { name: 'title',   weight: 0.5 },
+    { name: 'authors', weight: 0.2 },
+    { name: 'tags',    weight: 0.2 },
+    { name: 'summary', weight: 0.1 },
   ],
 }
 
@@ -53,16 +58,30 @@ export default function SearchBar() {
   const [open, setOpen] = useState(false)
   const [active, setActive] = useState(0)
 
-  // ── Load the search index once on mount ─────────────────────────────────
+  // ── Load papers from Tauri at runtime ──────────────────────────────────
   useEffect(() => {
     let cancelled = false
-    fetch('/search-index.json')
-      .then((r) => (r.ok ? r.json() : []))
-      .then((data: SearchEntry[]) => {
-        if (!cancelled && Array.isArray(data)) setEntries(data)
+    // content-root is only available after onboarding; Header hides itself
+    // on /onboarding, so this guard is purely defensive.
+    if (!getContentRoot()) return
+
+    listAllPapers()
+      .then((papers) => {
+        if (cancelled) return
+        setEntries(
+          papers.map((p) => ({
+            title: p.title,
+            authors: p.authors,
+            tags: p.tags,
+            summary: p.summary ?? '',
+            category: p.category,
+            slug: p.slug,
+            year: p.year,
+          })),
+        )
       })
       .catch(() => {
-        // search-index is optional — empty array is fine
+        // Search is optional — silently stay empty on any error.
       })
     return () => {
       cancelled = true
@@ -110,8 +129,6 @@ export default function SearchBar() {
   }, [fuse, query])
 
   // Keep the highlighted index in bounds when the result set changes.
-  // The setState is deferred past an await so it doesn't violate the
-  // react-hooks/set-state-in-effect rule.
   useEffect(() => {
     let cancelled = false
     ;(async () => {
@@ -173,7 +190,7 @@ export default function SearchBar() {
           }}
           onFocus={() => setOpen(true)}
           onKeyDown={onKeyDown}
-          placeholder="논문 검색…"
+          placeholder="논문 검색 (제목·저자)…"
           spellCheck={false}
           autoComplete="off"
           className="w-full rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 pl-9 pr-16 py-2 text-sm text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500 transition-colors"
@@ -220,7 +237,12 @@ export default function SearchBar() {
                     {entry.category}
                   </span>
                 )}
-                <span className="truncate font-mono">{entry.slug}</span>
+                {entry.authors.length > 0 && (
+                  <span className="truncate">
+                    {entry.authors.slice(0, 2).join(', ')}
+                    {entry.authors.length > 2 && ' 외'}
+                  </span>
+                )}
               </div>
             </li>
           ))}

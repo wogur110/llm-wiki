@@ -216,6 +216,7 @@ pub fn run() {
             zotero::list_collection_pdf_items,
             zotero::list_all_pdf_items,
             zotero::download_attachment,
+            zotero::sync_zotero_structure,
             // ── Pending sync ──────────────────────────────────────────────
             pending_sync::enqueue,
             pending_sync::load_queue,
