@@ -89,10 +89,18 @@ export default function OrganizeProgress() {
   if (!visible) return null
 
   // Determine overall completion state.
-  const allSettled = STEP_KEYS.every(k => {
-    const s = steps[k]?.status
-    return s === 'done' || s === 'skipped' || s === 'failed'
-  })
+  // When any step fails, subsequent steps never fire — treat hasFailed as settled
+  // so the dismiss button appears and the user isn't left with a stuck widget.
+  const allSettled =
+    hasFailed ||
+    STEP_KEYS.every(k => {
+      const s = steps[k]?.status
+      return s === 'done' || s === 'skipped' || s === 'failed'
+    })
+
+  const failedDetail = hasFailed
+    ? STEP_KEYS.map(k => steps[k]).find(s => s?.status === 'failed')?.detail
+    : undefined
 
   const handleDismiss = () => {
     setVisible(false)
@@ -149,11 +157,16 @@ export default function OrganizeProgress() {
 
       {/* Failure notice */}
       {hasFailed && (
-        <div className="mx-4 mb-3 rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-950/50 px-3 py-2">
+        <div className="mx-4 mb-3 rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-950/50 px-3 py-2 space-y-1">
           <p className="text-xs text-red-700 dark:text-red-300 leading-relaxed">
             오류가 발생했습니다.
             파일이 <code className="font-mono">unclassified/</code>로 복구되었습니다.
           </p>
+          {failedDetail && (
+            <p className="text-[11px] text-red-600 dark:text-red-400 break-all font-mono leading-snug">
+              {failedDetail}
+            </p>
+          )}
         </div>
       )}
 

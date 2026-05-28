@@ -32,7 +32,7 @@ import { usePaperPreview } from '@/components/PaperPreviewContext'
 type OrganizeState =
   | { kind: 'idle' }
   | { kind: 'running'; done: number; total: number; current: string }
-  | { kind: 'finished'; success: number; failed: number; total: number }
+  | { kind: 'finished'; success: number; failed: number; total: number; lastError?: string }
 
 type ImportSource = 'unclassified' | 'library'
 
@@ -169,6 +169,7 @@ export default function DashboardPage() {
 
     let success = 0
     let failed = 0
+    let lastError: string | undefined
     for (let i = 0; i < targets.length; i++) {
       const t = targets[i]
       setOrganize({
@@ -185,12 +186,13 @@ export default function DashboardPage() {
           pdfFilename: null,
         })
         success++
-      } catch {
+      } catch (e) {
+        lastError = String(e)
         failed++
       }
     }
 
-    setOrganize({ kind: 'finished', success, failed, total: targets.length })
+    setOrganize({ kind: 'finished', success, failed, total: targets.length, lastError })
     await refresh()
   }
 
@@ -366,6 +368,15 @@ export default function DashboardPage() {
             {' '}— {importState.failed}/{importState.total}개 실패.
           </span>{' '}
           마지막 오류: {importState.lastError}
+        </div>
+      )}
+
+      {organize.kind === 'finished' && organize.failed > 0 && organize.lastError && (
+        <div className="rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/40 px-4 py-3 text-sm text-amber-800 dark:text-amber-200">
+          <span className="font-semibold">
+            논문 정리 — {organize.failed}/{organize.total}개 실패.
+          </span>{' '}
+          마지막 오류: {organize.lastError}
         </div>
       )}
 
