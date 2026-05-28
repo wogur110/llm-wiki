@@ -20,6 +20,8 @@ export default function PaperPreviewDrawer() {
   const [zoteroError, setZoteroError] = useState<string | null>(null)
   const [summarizing, setSummarizing] = useState(false)
   const [summaryError, setSummaryError] = useState<string | null>(null)
+  const [openingFolder, setOpeningFolder] = useState(false)
+  const [folderError, setFolderError] = useState<string | null>(null)
 
   if (previewPaper !== prevPaper) {
     setPrevPaper(previewPaper)
@@ -28,6 +30,7 @@ export default function PaperPreviewDrawer() {
       setIsOpen(true)
       setZoteroError(null)
       setSummaryError(null)
+      setFolderError(null)
     } else {
       setIsOpen(false)
     }
@@ -76,6 +79,29 @@ export default function PaperPreviewDrawer() {
       setSummaryError(String(e))
     } finally {
       setSummarizing(false)
+    }
+  }
+
+  const handleOpenFolder = async () => {
+    if (openingFolder || !activePaper.zotero_key) return
+    setOpeningFolder(true)
+    setFolderError(null)
+    try {
+      const pdfPath = await invoke<string | null>('get_pdf_local_path', {
+        itemKey: activePaper.zotero_key,
+      })
+      if (!pdfPath) {
+        setFolderError('이 항목에 연결된 PDF 파일이 없습니다.')
+        return
+      }
+      // Derive parent directory — handles both Windows (\) and Unix (/) separators.
+      const lastSep = Math.max(pdfPath.lastIndexOf('/'), pdfPath.lastIndexOf('\\'))
+      const parentDir = lastSep > 0 ? pdfPath.slice(0, lastSep) : pdfPath
+      await shellOpen(parentDir)
+    } catch (e) {
+      setFolderError(String(e))
+    } finally {
+      setOpeningFolder(false)
     }
   }
 
@@ -312,6 +338,22 @@ export default function PaperPreviewDrawer() {
           {zoteroError && (
             <p className="text-[11px] text-red-500 text-center mt-1 break-all">
               {zoteroError}
+            </p>
+          )}
+
+          {activePaper.zotero_key && (
+            <button
+              type="button"
+              onClick={handleOpenFolder}
+              disabled={openingFolder}
+              className="flex w-full items-center justify-center gap-2 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-4 py-2.5 text-sm font-semibold text-zinc-700 dark:text-zinc-300 transition-all hover:bg-zinc-50 dark:hover:bg-zinc-800 active:scale-[0.98] disabled:opacity-50"
+            >
+              {openingFolder ? 'PDF 폴더 여는 중…' : 'PDF 위치 열기'}
+            </button>
+          )}
+          {folderError && (
+            <p className="text-[11px] text-red-500 text-center mt-1 break-all">
+              {folderError}
             </p>
           )}
         </div>

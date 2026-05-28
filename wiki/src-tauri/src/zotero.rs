@@ -968,6 +968,109 @@ async fn first_pdf_attachment(
     }))
 }
 
+/// Resolve the home directory without the `dirs` crate.
+fn home_dir() -> Option<std::path::PathBuf> {
+    if cfg!(windows) {
+        std::env::var("USERPROFILE")
+            .ok()
+            .map(std::path::PathBuf::from)
+    } else {
+        std::env::var("HOME").ok().map(std::path::PathBuf::from)
+    }
+}
+
+/// Return the local file-system path of the first PDF attachment belonging to
+/// `item_key`, or `None` if the item has no PDF attachment.
+///
+/// **linked_file** (ZotMoov): the `path` field already contains the absolute
+/// OS path.  If the path uses the `attachments:` prefix it is relative to the
+/// user's Zotero linked-attachment base directory, which we cannot resolve
+/// automatically — an error is returned in that case.
+///
+/// **imported_file / imported_url**: the file lives under the default Zotero
+/// data directory at `~/Zotero/storage/{attachment_key}/{filename}`.
+#[tauri::command]
+pub async fn get_pdf_local_path(item_key: String) -> Result<Option<String>, String> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .default_headers({
+            use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
+            let mut h = HeaderMap::new();
+            h.insert(USER_AGENT, HeaderValue::from_static("LLM-Wiki/0.1 (+tauri)"));
+            h.insert("Zotero-Allowed-Request", HeaderValue::from_static("1"));
+            h
+        })
+        .build()
+        .map_err(|e| format!("HTTP 클라이언트 초기화 실패: {e}"))?;
+
+    let children: Vec<serde_json::Value> = client
+        .get(format!("{ZOTERO_API}/items/{item_key}/children"))
+        .send()
+        .await
+        .map_err(|e| format!("Zotero 연결 실패: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("Zotero API 오류: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("응답 파싱 오류: {e}"))?;
+
+    for child in &children {
+        let is_pdf = child["data"]["contentType"].as_str() == Some("application/pdf");
+        if !is_pdf {
+            continue;
+        }
+
+        let attachment_key = match child["key"].as_str() {
+            Some(k) => k,
+            None => continue,
+        };
+        let link_mode = child["data"]["linkMode"].as_str().unwrap_or("");
+
+        match link_mode {
+            "linked_file" => {
+                let raw = match child["data"]["path"].as_str() {
+                    Some(p) => p,
+                    None => continue,
+                };
+                // Strip `attachments:` prefix produced by Zotero's linked-base-dir scheme.
+                let path_str = raw.trim_start_matches("attachments:");
+                let p = std::path::Path::new(path_str);
+                if p.is_absolute() {
+                    return Ok(Some(path_str.to_string()));
+                }
+                // Relative path: cannot resolve without the Zotero linked-attachment base dir.
+                return Err(format!(
+                    "PDF 경로가 상대 경로입니다 ({path_str}). \
+                    Zotero 환경설정 → 고급 → '연결된 첨부 파일 기본 디렉토리'를 확인하세요."
+                ));
+            }
+            "imported_file" | "imported_url" => {
+                let filename = match child["data"]["filename"].as_str() {
+                    Some(f) => f,
+                    None => continue,
+                };
+                let home = home_dir()
+                    .ok_or_else(|| "홈 디렉토리를 확인할 수 없습니다.".to_string())?;
+                let path = home
+                    .join("Zotero")
+                    .join("storage")
+                    .join(attachment_key)
+                    .join(filename);
+                if path.exists() {
+                    return Ok(Some(path.to_string_lossy().into_owned()));
+                }
+                return Err(format!(
+                    "가져온 첨부파일({filename})을 기본 경로에서 찾을 수 없습니다: {}",
+                    path.display()
+                ));
+            }
+            _ => continue,
+        }
+    }
+
+    Ok(None)
+}
+
 /// Download an attachment's raw file bytes (PDFs, EPUBs, …) via the local API.
 ///
 /// The Zotero local API serves both imported and linked attachments through

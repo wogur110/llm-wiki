@@ -239,6 +239,8 @@ pub fn run() {
             content::reset_wiki_content,
             // ── Summariser ────────────────────────────────────────────────
             summarize::summarize_paper,
+            // ── Zotero storage ────────────────────────────────────────────
+            zotero::get_pdf_local_path,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
