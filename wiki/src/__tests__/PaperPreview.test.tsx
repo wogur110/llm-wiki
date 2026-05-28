@@ -2,10 +2,6 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import React from 'react'
 
-vi.mock('@tauri-apps/plugin-shell', () => ({
-  open: vi.fn(),
-}))
-
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn(),
 }))
@@ -26,7 +22,6 @@ vi.mock('next/link', () => ({
   ),
 }))
 
-import { open as shellOpen } from '@tauri-apps/plugin-shell'
 import { invoke } from '@tauri-apps/api/core'
 import {
   PaperPreviewProvider,
@@ -34,7 +29,6 @@ import {
 } from '../components/PaperPreviewContext'
 import { type PaperMeta } from '../lib/content'
 
-const mockedShellOpen = vi.mocked(shellOpen)
 const mockedInvoke = vi.mocked(invoke)
 
 const samplePaper: PaperMeta = {
@@ -93,7 +87,6 @@ describe('usePaperPreview', () => {
 describe('PaperPreviewProvider + drawer', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    mockedShellOpen.mockResolvedValue(undefined)
   })
 
   it('opens the drawer with paper metadata when openPreview is called', async () => {
@@ -149,32 +142,40 @@ describe('PaperPreviewProvider + drawer', () => {
     })
   })
 
-  it('opens Zotero via shell when the footer button is clicked', async () => {
+  it('opens PDF folder via open_folder when the footer button is clicked', async () => {
+    mockedInvoke
+      .mockResolvedValueOnce('C:\\Users\\user\\papers\\paper.pdf') // get_pdf_local_path
+      .mockResolvedValueOnce(undefined)                            // open_folder
+
     renderWithProvider()
     fireEvent.click(screen.getByRole('button', { name: 'open-preview' }))
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Zotero에서 열기' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'PDF 위치 열기' })).toBeInTheDocument()
     })
 
-    fireEvent.click(screen.getByRole('button', { name: 'Zotero에서 열기' }))
+    fireEvent.click(screen.getByRole('button', { name: 'PDF 위치 열기' }))
 
     await waitFor(() => {
-      expect(mockedShellOpen).toHaveBeenCalledWith('zotero://select/items/ABCD1234')
+      expect(mockedInvoke).toHaveBeenCalledWith('get_pdf_local_path', { itemKey: 'ABCD1234' })
+      expect(mockedInvoke).toHaveBeenCalledWith('open_folder', {
+        path: 'C:\\Users\\user\\papers\\paper.pdf',
+      })
     })
   })
 
-  it('shows an error when shell.open fails', async () => {
-    mockedShellOpen.mockRejectedValueOnce(new Error('shell unavailable'))
+  it('shows an error when no PDF attachment is found', async () => {
+    mockedInvoke.mockResolvedValueOnce(null) // get_pdf_local_path returns null
+
     renderWithProvider()
     fireEvent.click(screen.getByRole('button', { name: 'open-preview' }))
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Zotero에서 열기' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'PDF 위치 열기' })).toBeInTheDocument()
     })
 
-    fireEvent.click(screen.getByRole('button', { name: 'Zotero에서 열기' }))
+    fireEvent.click(screen.getByRole('button', { name: 'PDF 위치 열기' }))
 
     await waitFor(() => {
-      expect(screen.getByText(/shell unavailable/)).toBeInTheDocument()
+      expect(screen.getByText(/이 항목에 연결된 PDF 파일이 없습니다/)).toBeInTheDocument()
     })
   })
 
@@ -202,7 +203,7 @@ describe('PaperPreviewProvider + drawer', () => {
       screen.getByRole('button', { name: /AI 요약 생성/ }),
     ).toBeInTheDocument()
     expect(
-      screen.queryByRole('button', { name: 'Zotero에서 열기' }),
+      screen.queryByRole('button', { name: 'PDF 위치 열기' }),
     ).not.toBeInTheDocument()
   })
 
