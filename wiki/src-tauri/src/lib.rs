@@ -241,6 +241,7 @@ pub fn run() {
             summarize::summarize_paper,
             // ── Zotero storage ────────────────────────────────────────────
             zotero::get_pdf_local_path,
+            zotero::open_folder,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

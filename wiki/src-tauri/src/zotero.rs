@@ -968,6 +968,45 @@ async fn first_pdf_attachment(
     }))
 }
 
+/// Open the directory that contains `path` in the OS default file manager.
+///
+/// * **Windows**: `explorer /select,"<path>"` — reveals and selects the file.
+/// * **macOS**: `open -R <path>` — reveals in Finder.
+/// * **Linux**: `xdg-open <parent_dir>` — opens the parent folder.
+///
+/// `path` should be the absolute path to the PDF file (not the directory).
+#[tauri::command]
+pub fn open_folder(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{path}"))
+            .spawn()
+            .map_err(|e| format!("Explorer 실행 실패: {e}"))?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .args(["-R", &path])
+            .spawn()
+            .map_err(|e| format!("Finder 실행 실패: {e}"))?;
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let dir = p.parent().unwrap_or(p);
+        std::process::Command::new("xdg-open")
+            .arg(dir)
+            .spawn()
+            .map_err(|e| format!("파일 관리자 실행 실패: {e}"))?;
+    }
+
+    Ok(())
+}
+
 /// Resolve the home directory without the `dirs` crate.
 fn home_dir() -> Option<std::path::PathBuf> {
     if cfg!(windows) {

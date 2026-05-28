@@ -3,7 +3,6 @@
 import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { invoke } from '@tauri-apps/api/core'
-import { open as shellOpen } from '@tauri-apps/plugin-shell'
 import {
   type PaperMeta,
   formatDate,
@@ -16,8 +15,6 @@ export default function PaperPreviewDrawer() {
   const [prevPaper, setPrevPaper] = useState<PaperMeta | null>(null)
   const [activePaper, setActivePaper] = useState<PaperMeta | null>(null)
   const [isOpen, setIsOpen] = useState(false)
-  const [openingZotero, setOpeningZotero] = useState(false)
-  const [zoteroError, setZoteroError] = useState<string | null>(null)
   const [summarizing, setSummarizing] = useState(false)
   const [summaryError, setSummaryError] = useState<string | null>(null)
   const [openingFolder, setOpeningFolder] = useState(false)
@@ -28,7 +25,6 @@ export default function PaperPreviewDrawer() {
     if (previewPaper) {
       setActivePaper(previewPaper)
       setIsOpen(true)
-      setZoteroError(null)
       setSummaryError(null)
       setFolderError(null)
     } else {
@@ -46,19 +42,6 @@ export default function PaperPreviewDrawer() {
   }, [isOpen, activePaper])
 
   if (!activePaper) return null
-
-  const handleOpenZotero = async () => {
-    if (!activePaper.zotero_key) return
-    setOpeningZotero(true)
-    setZoteroError(null)
-    try {
-      await shellOpen(`zotero://select/items/${activePaper.zotero_key}`)
-    } catch (e) {
-      setZoteroError(String(e))
-    } finally {
-      setOpeningZotero(false)
-    }
-  }
 
   const handleGenerateSummary = async () => {
     if (summarizing) return
@@ -94,10 +77,7 @@ export default function PaperPreviewDrawer() {
         setFolderError('이 항목에 연결된 PDF 파일이 없습니다.')
         return
       }
-      // Derive parent directory — handles both Windows (\) and Unix (/) separators.
-      const lastSep = Math.max(pdfPath.lastIndexOf('/'), pdfPath.lastIndexOf('\\'))
-      const parentDir = lastSep > 0 ? pdfPath.slice(0, lastSep) : pdfPath
-      await shellOpen(parentDir)
+      await invoke('open_folder', { path: pdfPath })
     } catch (e) {
       setFolderError(String(e))
     } finally {
@@ -324,22 +304,6 @@ export default function PaperPreviewDrawer() {
           >
             상세 메모 보기
           </Link>
-
-          {activePaper.zotero_key && (
-            <button
-              type="button"
-              onClick={handleOpenZotero}
-              disabled={openingZotero}
-              className="flex w-full items-center justify-center gap-2 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-4 py-2.5 text-sm font-semibold text-zinc-700 dark:text-zinc-300 transition-all hover:bg-zinc-50 dark:hover:bg-zinc-800 active:scale-[0.98] disabled:opacity-50"
-            >
-              {openingZotero ? 'Zotero 여는 중…' : 'Zotero에서 열기'}
-            </button>
-          )}
-          {zoteroError && (
-            <p className="text-[11px] text-red-500 text-center mt-1 break-all">
-              {zoteroError}
-            </p>
-          )}
 
           {activePaper.zotero_key && (
             <button
