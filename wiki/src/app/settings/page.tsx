@@ -150,6 +150,50 @@ export default function SettingsPage() {
     router.replace('/onboarding')
   }
 
+  // ── Wiki-content reset ──────────────────────────────────────────────────
+  const [wipeState, setWipeState] = useState<SaveState>('idle')
+  const [wipeError, setWipeError] = useState('')
+  const [wipeSummary, setWipeSummary] = useState<{
+    papers_removed: number
+    meta_files_removed: number
+  } | null>(null)
+
+  const handleWipeContent = async () => {
+    if (wipeState === 'saving') return
+    if (
+      !window.confirm(
+        '정말로 모든 위키 폴더를 삭제할까요?\n\n' +
+          '• content/papers/ 아래의 모든 카테고리·논문이 사라집니다.\n' +
+          '• content/meta/ 아래의 백링크·검색 인덱스·대기 큐가 사라집니다.\n' +
+          '• Gemini API 키와 Zotero 라이브러리는 영향을 받지 않습니다.\n\n' +
+          '이 작업은 되돌릴 수 없습니다.',
+      )
+    ) {
+      return
+    }
+    const root = window.localStorage.getItem('content-root') ?? ''
+    if (!root) {
+      setWipeState('error')
+      setWipeError('위키 폴더 경로를 찾을 수 없습니다. 앱을 재시작해 주세요.')
+      return
+    }
+    setWipeState('saving')
+    setWipeError('')
+    setWipeSummary(null)
+    try {
+      const r = await invoke<{
+        papers_removed: number
+        meta_files_removed: number
+      }>('reset_wiki_content', { contentRoot: root })
+      setWipeSummary(r)
+      setWipeState('success')
+      await refreshPending(root)
+    } catch (e) {
+      setWipeState('error')
+      setWipeError(String(e))
+    }
+  }
+
   // ── Render ──────────────────────────────────────────────────────────────
   return (
     <div className="mx-auto max-w-3xl px-6 py-8 space-y-6">
@@ -285,8 +329,32 @@ export default function SettingsPage() {
         )}
       </Card>
 
-      {/* ── Reset ──────────────────────────────────────────────────── */}
-      <Card title="초기화" subtitle="설정을 모두 지우고 온보딩으로 돌아갑니다.">
+      {/* ── Wipe wiki content ─────────────────────────────────────── */}
+      <Card
+        title="LLM-Wiki 초기화"
+        subtitle="모든 카테고리 폴더와 논문, 백링크·검색 인덱스를 삭제합니다. Gemini API 키와 Zotero 라이브러리는 영향을 받지 않습니다."
+      >
+        <button
+          type="button"
+          onClick={handleWipeContent}
+          disabled={wipeState === 'saving'}
+          className="rounded-lg border border-red-300 dark:border-red-800 bg-red-50 dark:bg-red-950/40 px-3 py-1.5 text-xs font-semibold text-red-700 dark:text-red-300 transition-colors hover:bg-red-100 dark:hover:bg-red-950/60 disabled:opacity-50"
+        >
+          {wipeState === 'saving' ? '삭제 중…' : '위키 폴더 전부 삭제'}
+        </button>
+        {wipeState === 'success' && wipeSummary && (
+          <p className="mt-2 text-xs text-green-600 dark:text-green-400">
+            ✓ 카테고리/파일 {wipeSummary.papers_removed}개, 메타 파일{' '}
+            {wipeSummary.meta_files_removed}개 삭제 완료.
+          </p>
+        )}
+        {wipeState === 'error' && (
+          <p className="mt-2 text-xs text-red-500 break-all">✗ {wipeError}</p>
+        )}
+      </Card>
+
+      {/* ── Reset (onboarding) ────────────────────────────────────── */}
+      <Card title="앱 설정 초기화" subtitle="API 키와 캐시를 지우고 온보딩으로 돌아갑니다.">
         <button
           type="button"
           onClick={handleReset}

@@ -5,6 +5,7 @@ pub mod keychain;
 pub mod organizer;
 pub mod pdf_import;
 pub mod pending_sync;
+pub mod summarize;
 pub mod transaction;
 pub mod zotero;
 
@@ -235,6 +236,9 @@ pub fn run() {
             content::find_paper_category,
             content::list_unclassified,
             content::read_backlinks,
+            content::reset_wiki_content,
+            // ── Summariser ────────────────────────────────────────────────
+            summarize::summarize_paper,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

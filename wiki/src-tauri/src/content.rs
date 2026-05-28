@@ -481,6 +481,105 @@ pub fn list_unclassified(
     Ok(out)
 }
 
+/// Result returned by [`reset_wiki_content`] so the UI can summarise what
+/// was removed.
+#[derive(Debug, Serialize)]
+pub struct ResetResult {
+    /// Number of top-level entries removed under `papers/`.
+    pub papers_removed: u32,
+    /// Number of files removed under `meta/`.
+    pub meta_files_removed: u32,
+}
+
+/// Wipe the wiki content tree and recreate the minimal scaffolding.
+///
+/// Removes everything under `content/papers/` and `content/meta/`, then
+/// recreates the two top-level entries the app needs to keep working:
+///   * `content/papers/unclassified/`
+///   * `content/meta/`
+///
+/// The Gemini API key (stored in the OS keychain) and the `content_root`
+/// path itself are intentionally preserved — the user only loses the wiki
+/// data, not their app setup.
+///
+/// Errors are returned eagerly when the *first* fatal I/O failure happens;
+/// in practice this only fires when the user does not own the directory.
+#[tauri::command]
+pub fn reset_wiki_content(content_root: String) -> Result<ResetResult, String> {
+    let root = PathBuf::from(&content_root);
+    if !root.is_dir() {
+        return Err(format!(
+            "content directory not found: {}",
+            root.display()
+        ));
+    }
+
+    let mut papers_removed = 0u32;
+    let mut meta_files_removed = 0u32;
+
+    // ── Wipe content/papers/ ──────────────────────────────────────────────
+    let papers_dir = root.join("papers");
+    if papers_dir.is_dir() {
+        for entry in fs::read_dir(&papers_dir)
+            .map_err(|e| format!("read_dir papers: {e}"))?
+            .flatten()
+        {
+            let path = entry.path();
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let result = if is_dir {
+                fs::remove_dir_all(&path)
+            } else {
+                fs::remove_file(&path)
+            };
+            match result {
+                Ok(()) => papers_removed += 1,
+                Err(e) => {
+                    return Err(format!(
+                        "Cannot remove {}: {e}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    // ── Wipe content/meta/ ────────────────────────────────────────────────
+    let meta_dir = root.join("meta");
+    if meta_dir.is_dir() {
+        for entry in fs::read_dir(&meta_dir)
+            .map_err(|e| format!("read_dir meta: {e}"))?
+            .flatten()
+        {
+            let path = entry.path();
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let result = if is_dir {
+                fs::remove_dir_all(&path)
+            } else {
+                fs::remove_file(&path)
+            };
+            match result {
+                Ok(()) => meta_files_removed += 1,
+                Err(e) => {
+                    return Err(format!(
+                        "Cannot remove {}: {e}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    // ── Recreate the minimum scaffolding ──────────────────────────────────
+    fs::create_dir_all(papers_dir.join("unclassified"))
+        .map_err(|e| format!("recreate papers/unclassified: {e}"))?;
+    fs::create_dir_all(&meta_dir).map_err(|e| format!("recreate meta: {e}"))?;
+
+    Ok(ResetResult {
+        papers_removed,
+        meta_files_removed,
+    })
+}
+
 /// Return the raw JSON contents of `content/meta/backlinks.json`.
 ///
 /// Returns the string `"{}"` if the file does not exist yet.
@@ -671,6 +770,48 @@ mod tests {
         let root = dir.path().join("content");
         fs::create_dir_all(&root).unwrap();
         assert!(list_categories(root.to_string_lossy().to_string()).is_err());
+    }
+
+    #[test]
+    fn reset_wiki_content_clears_papers_and_meta() {
+        let (_dir, root) = fixture_root();
+        let root_path = PathBuf::from(&root);
+
+        let cat_dir = root_path.join("papers").join("nlp");
+        fs::create_dir_all(&cat_dir).unwrap();
+        fs::write(cat_dir.join("paper.md"), "x").unwrap();
+        fs::write(
+            root_path
+                .join("meta")
+                .join(".processed-dois.json"),
+            "{}",
+        )
+        .unwrap();
+
+        let result = reset_wiki_content(root.clone()).unwrap();
+        assert!(result.papers_removed >= 1);
+        assert!(result.meta_files_removed >= 1);
+
+        let papers = root_path.join("papers");
+        let entries: Vec<_> = fs::read_dir(&papers)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(entries.len(), 1, "only unclassified must remain");
+        assert!(papers.join("unclassified").is_dir());
+
+        let meta_entries: Vec<_> = fs::read_dir(root_path.join("meta"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert!(meta_entries.is_empty());
+    }
+
+    #[test]
+    fn reset_wiki_content_errors_on_missing_root() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        assert!(reset_wiki_content(missing.to_string_lossy().into_owned()).is_err());
     }
 
     #[test]

@@ -422,6 +422,10 @@ struct PaperMeta<'a> {
     doi: Option<&'a str>,
     year: Option<&'a str>,
     authors: Option<&'a str>,
+    /// Journal / conference / book title — see [`ZoteroItemData::best_publication`].
+    publication: Option<&'a str>,
+    /// Item URL (used as a fallback link when no DOI is present).
+    url: Option<&'a str>,
     zotero_key: &'a str,
 }
 
@@ -432,6 +436,8 @@ fn build_metadata_markdown(m: PaperMeta<'_>) -> String {
     let title = escape_yaml_plain(m.title);
     let abstract_text = escape_yaml_plain(m.abstract_text);
     let authors = m.authors.map(escape_yaml_plain).unwrap_or_default();
+    let publication = m.publication.map(escape_yaml_plain).unwrap_or_default();
+    let url = m.url.map(escape_yaml_plain).unwrap_or_default();
     let doi = m.doi.unwrap_or("").trim();
     let year = m.year.unwrap_or("").trim();
 
@@ -440,8 +446,10 @@ fn build_metadata_markdown(m: PaperMeta<'_>) -> String {
          title: \"{title}\"\n\
          authors: \"{authors}\"\n\
          abstract: \"{abstract_text}\"\n\
+         publication: \"{publication}\"\n\
          doi: \"{doi}\"\n\
          year: {year}\n\
+         url: \"{url}\"\n\
          zotero_key: {zk}\n\
          ---\n\n\
          {body}\n",
@@ -581,6 +589,13 @@ pub async fn import_zotero_item_and_organize(
 
     let authors = format_authors(&item.data.creators);
     let year = extract_year(item.data.date.as_deref());
+    let publication = item.data.best_publication();
+    let url = item
+        .data
+        .url
+        .clone()
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty());
 
     // ── Resolve abstract: Zotero > Crossref/S2/OpenAlex > title search ────
     let zotero_abstract = item
@@ -620,6 +635,8 @@ pub async fn import_zotero_item_and_organize(
         doi: doi.as_deref(),
         year: year.as_deref(),
         authors: authors.as_deref(),
+        publication: publication.as_deref(),
+        url: url.as_deref(),
         zotero_key: &item_key,
     });
 
@@ -737,12 +754,16 @@ mod tests {
             doi: Some("10.1234/test"),
             year: Some("2017"),
             authors: Some("Ashish Vaswani, Noam Shazeer"),
+            publication: Some("NeurIPS 2017"),
+            url: Some("https://arxiv.org/abs/1706.03762"),
             zotero_key: "ABCD1234",
         });
         assert!(md.starts_with("---\n"));
         assert!(md.contains("title: \"Attention Is All You Need\""));
         assert!(md.contains("authors: \"Ashish Vaswani, Noam Shazeer\""));
         assert!(md.contains("abstract: \"We propose a new architecture.\""));
+        assert!(md.contains("publication: \"NeurIPS 2017\""));
+        assert!(md.contains("url: \"https://arxiv.org/abs/1706.03762\""));
         assert!(md.contains("doi: \"10.1234/test\""));
         assert!(md.contains("year: 2017"));
         assert!(md.contains("zotero_key: ABCD1234"));
@@ -757,9 +778,13 @@ mod tests {
             doi: None,
             year: None,
             authors: None,
+            publication: None,
+            url: None,
             zotero_key: "K",
         });
         assert!(md.contains("abstract: \"\""));
+        assert!(md.contains("publication: \"\""));
+        assert!(md.contains("url: \"\""));
         assert!(md.contains("year: "));
         assert!(!md.contains("## Abstract"));
     }

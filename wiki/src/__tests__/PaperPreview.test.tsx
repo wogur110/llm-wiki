@@ -6,6 +6,10 @@ vi.mock('@tauri-apps/plugin-shell', () => ({
   open: vi.fn(),
 }))
 
+vi.mock('@tauri-apps/api/core', () => ({
+  invoke: vi.fn(),
+}))
+
 vi.mock('next/link', () => ({
   default: ({
     children,
@@ -23,6 +27,7 @@ vi.mock('next/link', () => ({
 }))
 
 import { open as shellOpen } from '@tauri-apps/plugin-shell'
+import { invoke } from '@tauri-apps/api/core'
 import {
   PaperPreviewProvider,
   usePaperPreview,
@@ -30,6 +35,7 @@ import {
 import { type PaperMeta } from '../lib/content'
 
 const mockedShellOpen = vi.mocked(shellOpen)
+const mockedInvoke = vi.mocked(invoke)
 
 const samplePaper: PaperMeta = {
   slug: 'attention',
@@ -40,8 +46,10 @@ const samplePaper: PaperMeta = {
   authors: ['Ashish Vaswani', 'Noam Shazeer'],
   publication: 'NeurIPS',
   doi: '10.1234/test',
+  url: 'https://arxiv.org/abs/1706.03762',
   zotero_key: 'ABCD1234',
   tags: ['nlp', 'transformers'],
+  abstract: 'We rely entirely on attention mechanisms.',
   summary: 'We propose a new architecture based on attention.',
   extra: {},
 }
@@ -170,7 +178,7 @@ describe('PaperPreviewProvider + drawer', () => {
     })
   })
 
-  it('shows placeholder when summary is missing', async () => {
+  it('shows the AI summary generator when summary is missing', async () => {
     const noSummary: PaperMeta = { ...samplePaper, summary: null, zotero_key: null }
     function OpenNoSummary() {
       const { openPreview } = usePaperPreview()
@@ -188,9 +196,96 @@ describe('PaperPreviewProvider + drawer', () => {
     fireEvent.click(screen.getByRole('button', { name: 'open-no-summary' }))
 
     await waitFor(() => {
-      expect(screen.getByText(/요약정보가 존재하지 않습니다/)).toBeInTheDocument()
+      expect(screen.getByText(/아직 AI 요약이 없습니다/)).toBeInTheDocument()
     })
-    expect(screen.queryByRole('button', { name: 'Zotero에서 열기' })).not.toBeInTheDocument()
+    expect(
+      screen.getByRole('button', { name: /AI 요약 생성/ }),
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByRole('button', { name: 'Zotero에서 열기' }),
+    ).not.toBeInTheDocument()
+  })
+
+  it('renders the abstract block separately from the AI summary', async () => {
+    renderWithProvider()
+    fireEvent.click(screen.getByRole('button', { name: 'open-preview' }))
+    await waitFor(() => {
+      expect(drawerTitle()).toBeInTheDocument()
+    })
+    expect(screen.getByText('초록')).toBeInTheDocument()
+    expect(
+      screen.getByText('We rely entirely on attention mechanisms.'),
+    ).toBeInTheDocument()
+  })
+
+  it('generates an AI summary via Gemini and displays the result', async () => {
+    const noSummary: PaperMeta = { ...samplePaper, summary: null }
+    window.localStorage.setItem('content-root', '/tmp/wiki')
+    mockedInvoke.mockResolvedValueOnce({
+      summary: '한국어 요약입니다.',
+    })
+
+    function OpenNoSummary() {
+      const { openPreview } = usePaperPreview()
+      return (
+        <button type="button" onClick={() => openPreview(noSummary)}>
+          open-no-summary
+        </button>
+      )
+    }
+    render(
+      <PaperPreviewProvider>
+        <OpenNoSummary />
+      </PaperPreviewProvider>,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'open-no-summary' }))
+    await waitFor(() => {
+      expect(
+        screen.getByRole('button', { name: /AI 요약 생성/ }),
+      ).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /AI 요약 생성/ }))
+
+    await waitFor(() => {
+      expect(mockedInvoke).toHaveBeenCalledWith('summarize_paper', {
+        contentRoot: '/tmp/wiki',
+        slug: 'attention',
+      })
+      expect(screen.getByText('한국어 요약입니다.')).toBeInTheDocument()
+    })
+  })
+
+  it('surfaces summary generation errors', async () => {
+    const noSummary: PaperMeta = { ...samplePaper, summary: null }
+    window.localStorage.setItem('content-root', '/tmp/wiki')
+    mockedInvoke.mockRejectedValueOnce(new Error('Gemini quota exhausted'))
+
+    function OpenNoSummary() {
+      const { openPreview } = usePaperPreview()
+      return (
+        <button type="button" onClick={() => openPreview(noSummary)}>
+          open-no-summary
+        </button>
+      )
+    }
+    render(
+      <PaperPreviewProvider>
+        <OpenNoSummary />
+      </PaperPreviewProvider>,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'open-no-summary' }))
+    await waitFor(() => {
+      expect(
+        screen.getByRole('button', { name: /AI 요약 생성/ }),
+      ).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /AI 요약 생성/ }))
+
+    await waitFor(() => {
+      expect(screen.getByText(/Gemini quota exhausted/)).toBeInTheDocument()
+    })
   })
 
 })

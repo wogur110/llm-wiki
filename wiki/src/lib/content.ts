@@ -71,8 +71,14 @@ export interface PaperMeta {
   authors: string[]
   publication: string | null
   doi: string | null
+  /** External URL — typically a Zotero `url` field (arXiv, journal page, …). */
+  url: string | null
   zotero_key: string | null
   tags: string[]
+  /** Paper abstract — usually populated by the importer from Zotero/Crossref. */
+  abstract: string | null
+  /** AI-generated summary — separate from the abstract; nullable so the UI can
+   *  surface a "generate summary" action when missing. */
   summary: string | null
   extra: Record<string, unknown>
 }
@@ -124,6 +130,8 @@ function buildMeta(
     'journal',
     'doi',
     'DOI',
+    'url',
+    'URL',
     'zotero_key',
     'zoteroKey',
     'tags',
@@ -135,6 +143,16 @@ function buildMeta(
     if (!known.has(k)) extra[k] = v
   }
 
+  // Authors: tolerate both a single string ("Foo, Bar") and a list.
+  const rawAuthors = fm.authors ?? fm.author
+  const authors =
+    typeof rawAuthors === 'string'
+      ? rawAuthors
+          .split(/\s*,\s*/)
+          .map((s) => s.trim())
+          .filter(Boolean)
+      : asStringArray(rawAuthors)
+
   const yearRaw = fm.year ?? fm.date
   return {
     slug,
@@ -144,17 +162,17 @@ function buildMeta(
       asStringOrNull(fm.title) ??
       slug.replace(/-/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()),
     year: asNumberOrNull(yearRaw),
-    authors: asStringArray(fm.authors ?? fm.author),
+    authors,
     publication:
       asStringOrNull(fm.publication) ??
       asStringOrNull(fm.venue) ??
       asStringOrNull(fm.journal),
     doi: asStringOrNull(fm.doi ?? fm.DOI),
+    url: asStringOrNull(fm.url ?? fm.URL),
     zotero_key: asStringOrNull(fm.zotero_key ?? fm.zoteroKey),
     tags: asStringArray(fm.tags),
-    summary:
-      asStringOrNull(fm.summary) ??
-      asStringOrNull(fm.abstract),
+    abstract: asStringOrNull(fm.abstract),
+    summary: asStringOrNull(fm.summary),
     extra,
   }
 }

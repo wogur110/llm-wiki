@@ -85,6 +85,51 @@ pub struct ZoteroItemData {
     pub date: Option<String>,
     /// `url` field — used as a last-resort link when no DOI exists.
     pub url: Option<String>,
+    /// Journal title for journal articles (e.g. "Nature", "JMLR").
+    #[serde(rename = "publicationTitle")]
+    pub publication_title: Option<String>,
+    /// Short journal name (e.g. "Nat. Commun.").
+    #[serde(rename = "journalAbbreviation")]
+    pub journal_abbreviation: Option<String>,
+    /// Conference name for conference papers (e.g. "NeurIPS 2023").
+    #[serde(rename = "conferenceName")]
+    pub conference_name: Option<String>,
+    /// Proceedings title for conference papers (e.g. "Proc. of CVPR").
+    #[serde(rename = "proceedingsTitle")]
+    pub proceedings_title: Option<String>,
+    /// Book title for book chapters.
+    #[serde(rename = "bookTitle")]
+    pub book_title: Option<String>,
+    /// Repository for preprints (e.g. "arXiv", "bioRxiv").
+    pub repository: Option<String>,
+    /// Publisher (e.g. "MIT Press").
+    pub publisher: Option<String>,
+}
+
+impl ZoteroItemData {
+    /// Pick the most descriptive "venue / publication" field for this item,
+    /// trying every Zotero item-type-specific field in priority order.
+    ///
+    /// Returns the trimmed string, or `None` if every candidate is empty.
+    pub fn best_publication(&self) -> Option<String> {
+        for candidate in [
+            self.publication_title.as_deref(),
+            self.conference_name.as_deref(),
+            self.proceedings_title.as_deref(),
+            self.book_title.as_deref(),
+            self.journal_abbreviation.as_deref(),
+            self.repository.as_deref(),
+            self.publisher.as_deref(),
+        ] {
+            if let Some(s) = candidate {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+        None
+    }
 }
 
 /// One creator/author entry returned by the Zotero API.
@@ -1051,12 +1096,34 @@ mod tests {
                 "title": "Test Paper",
                 "abstractNote": "An abstract.",
                 "collections": ["COL1"],
-                "DOI": "10.1234/example"
+                "DOI": "10.1234/example",
+                "publicationTitle": "Nature",
+                "url": "https://example.com/paper"
             }
         }"#;
         let item: ZoteroItem = serde_json::from_str(raw).unwrap();
         assert_eq!(item.key, "ABCD1234");
         assert_eq!(item.data.doi.as_deref(), Some("10.1234/example"));
+        assert_eq!(item.data.best_publication().as_deref(), Some("Nature"));
+        assert_eq!(item.data.url.as_deref(), Some("https://example.com/paper"));
+    }
+
+    #[test]
+    fn best_publication_falls_through_to_conference_then_book() {
+        let raw = r#"{
+            "publicationTitle": "",
+            "conferenceName": "  CVPR 2023  ",
+            "bookTitle": "Should Be Skipped"
+        }"#;
+        let data: ZoteroItemData = serde_json::from_str(raw).unwrap();
+        assert_eq!(data.best_publication().as_deref(), Some("CVPR 2023"));
+    }
+
+    #[test]
+    fn best_publication_returns_none_when_all_empty() {
+        let raw = r#"{"publicationTitle": "  "}"#;
+        let data: ZoteroItemData = serde_json::from_str(raw).unwrap();
+        assert!(data.best_publication().is_none());
     }
 
     #[tokio::test]

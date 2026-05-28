@@ -157,7 +157,7 @@ describe('content helpers', () => {
       expect(papers[0].summary).toBe('Short summary.')
     })
 
-    it('listPapersInCategory uses abstract and slug title fallbacks', async () => {
+    it('listPapersInCategory exposes abstract separately from summary', async () => {
       localStorage.setItem('content-root', '/data/content')
       mockedInvoke.mockResolvedValueOnce([
         {
@@ -169,7 +169,8 @@ describe('content helpers', () => {
       ])
 
       const papers = await listPapersInCategory('nlp')
-      expect(papers[0].summary).toBe('From abstract field.')
+      expect(papers[0].abstract).toBe('From abstract field.')
+      expect(papers[0].summary).toBeNull()
       expect(papers[0].year).toBe(2019)
       expect(papers[0].title).toBe('My Paper')
     })
